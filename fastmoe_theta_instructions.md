@@ -1,6 +1,10 @@
 # Environment setup
 ## Installing fastmoe
 1. checked out fastmoe github from login node
+```
+git clone https://github.com/laekov/fastmoe.git
+git checkout 4edeccd95a66d1f2d5eb7ec7a9e40a9f67e0e393
+```
 2. login to thetagpusn1 & load modules
 ```
 module load conda/2021-06-26
@@ -21,6 +25,10 @@ python setup.py install
 
 # Prep Running
 1. checking megatron (tag: v2.2) and apply [changes](https://github.com/laekov/fastmoe/blob/master/examples/megatron/fmoefy-v2.2.patch)
+```
+git clone https://github.com/NVIDIA/Megatron-LM.git
+git checkout tags/v2.2
+```
 2. Note: do not apply `clip-grad-v2.2.patch` this caused hang
 3. add barrier on `megatron/initialize.py`. at line 133
 ```
@@ -57,12 +65,12 @@ RANK=0
 RANK=$((RANK+1))
 for node in $WORKERS; do
     echo "ssh to $node"
-    ssh -q $node /projects/CSC249ADOA01/hsyoo/fastmoe/Megatron-LM/run.sh "$NNODES" "$RANK" "$MASTER" &
+    ssh -q $node /projects/CSC249ADOA01/FastMoE/Megatron-LM/run.sh "$NNODES" "$RANK" "$MASTER" &
     RANK=$((RANK+1))
 done
 
 # Run master
-/projects/CSC249ADOA01/hsyoo/fastmoe/Megatron-LM/run.sh "$NNODES" 0 "$MASTER"
+/projects/CSC249ADOA01/FastMoE/Megatron-LM/run.sh "$NNODES" 0 "$MASTER"
 wait
 ```
 6. run script
@@ -75,9 +83,9 @@ module load conda/2021-06-26
 module load openmpi/openmpi-4.1.0_ucx-1.11.0_gcc-9.3.0
 module load nccl/nccl-v2.9.9-1_CUDA11.3
 
-conda activate /projects/CSC249ADOA01/hsyoo/fastmoe/conda_env
+conda activate /projects/CSC249ADOA01/FastMoE/conda_env
 
-cd /projects/CSC249ADOA01/hsyoo/fastmoe/Megatron-LM
+cd /projects/CSC249ADOA01/FastMoE/Megatron-LM
 
 NNODES=${1:-2}
 RANK=${2:-0}
@@ -90,8 +98,8 @@ MASTER_PORT=6000
 MICRO_BATCH_SIZE=2
 GLOBAL_BATCH_SIZE=$(($MICRO_BATCH_SIZE*$NNODES*$GPUS_PER_NODE))
 
-DATA_PATH=/projects/CSC249ADOA01/hsyoo/fastmoe/gpt-wiki/my-gpt2_text_document
-CHECKPOINT_PATH=/projects/CSC249ADOA01/hsyoo/fastmoe/workdir
+DATA_PATH=/projects/CSC249ADOA01/FastMoE/gpt-wiki/my-gpt2_text_document
+CHECKPOINT_PATH=/projects/CSC249ADOA01/FastMoE/workdir
 
 python -m torch.distributed.run \
     --nproc_per_node $GPUS_PER_NODE \
