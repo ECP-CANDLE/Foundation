@@ -4,6 +4,8 @@ from torch.utils.data import DataLoader
 import torch
 from argparse import ArgumentParser as ap
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
+from pytorch_lightning.strategies import DDPFullyShardedNativeStrategy
 
 from foundation.util.dataloading import PileH5Dataset
 from foundation.models.minGPT import GPT, GPTConfig
@@ -42,7 +44,7 @@ class LightningGPT(ptl.LightningModule):
         return loss
     
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.model.parameters(), self.args['learn_rate'])
+        return torch.optim.AdamW(self.trainer.model.parameters(), self.args['learn_rate'])
 
 def parse_args():
     par = ap()
@@ -67,6 +69,8 @@ def parse_args():
     args = vars(par)
     for k, v in args.items():
         print(f"{k}:{v}")
+
+    args['strategy'] = 'fsdp_native'
     return args
 
 def train_foundation_model(args):
@@ -78,11 +82,21 @@ def train_foundation_model(args):
     traindl = DataLoader(train_ds, batch_size=2, num_workers=0)
     valdl = DataLoader(val_ds, batch_size=2, num_workers=2)
 
+    if args['strategy'] == 'fsdp_native':
+        strat_args = DDPFullyShardedNativeStrategy(
+            cpu_offload=CPUOffload(offload_params=True),
+            sharding_strategy= None,
+            auto_wrap_policy= None,
+            backward_prefetch=None,
+            forward_prefetch=None,
+        )
     model = LightningGPT(args)
     callbatcks = [EarlyStopping(monitor="val_step_loss", mode="min")]
     trainer = ptl.Trainer(
         logger=logger,
+        strategy=strat_args,
         accelerator='gpu',
+        devices=args['num_gpus']
         max_epochs=2,
         default_root_dir=args['log_dir'],
         limit_val_batches=1.0,
