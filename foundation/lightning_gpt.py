@@ -8,8 +8,7 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
 from pytorch_lightning.strategies import DDPFullyShardedNativeStrategy
 
 from foundation.util.dataloading import PileH5Dataset
-from foundation.models.minGPT import GPT, GPTConfig
-
+from foundation.models.minGPT import GPT, GPTConfig, Block
 
 class LightningGPT(ptl.LightningModule):
     def __init__(self, args):
@@ -26,7 +25,8 @@ class LightningGPT(ptl.LightningModule):
                     bias = True
         )
 
-        self.model = torch.compile(GPT(config))
+        # self.model = torch.compile(GPT(config))
+        self.model = GPT(config)
 
 
     def forward(self, batch):
@@ -48,6 +48,8 @@ class LightningGPT(ptl.LightningModule):
 
 def parse_args():
     par = ap()
+
+    par.add_argument('--num-gpus', '-gpus', type=int, default=None)
 
     par.add_argument('--model', type=str, 
                         default=None, 
@@ -79,16 +81,17 @@ def train_foundation_model(args):
     train_ds = PileH5Dataset(args['datapath'], 'train')
     val_ds = PileH5Dataset(args['datapath'], 'validation')
 
-    traindl = DataLoader(train_ds, batch_size=2, num_workers=0)
+    traindl = DataLoader(train_ds, batch_size=16, num_workers=0)
     valdl = DataLoader(val_ds, batch_size=2, num_workers=2)
 
     if args['strategy'] == 'fsdp_native':
         strat_args = DDPFullyShardedNativeStrategy(
-            cpu_offload=CPUOffload(offload_params=True),
+            cpu_offload=CPUOffload(offload_params=False),
             sharding_strategy= None,
             auto_wrap_policy= None,
             backward_prefetch=None,
             forward_prefetch=None,
+            activation_checkpointing= Block
         )
     model = LightningGPT(args)
     callbatcks = [EarlyStopping(monitor="val_step_loss", mode="min")]
@@ -96,9 +99,10 @@ def train_foundation_model(args):
         logger=logger,
         strategy=strat_args,
         accelerator='gpu',
-        devices=args['num_gpus']
+        devices=args['num_gpus'],
         max_epochs=2,
         default_root_dir=args['log_dir'],
+        precision=16,
         limit_val_batches=1.0,
         limit_train_batches=1.0
     )
