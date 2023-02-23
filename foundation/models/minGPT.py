@@ -16,8 +16,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
-# @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
+from torch.distributed.fsdp.wrap import wrap # we'll manually wrap things. a wrap ~ a shard, so this level of control is nice.
+                                            # roughly following https://medium.com/pytorch/training-a-1-trillion-parameter-model-with-pytorch-fully-sharded-data-parallel-on-aws-3ac13aa96cff
+from torch.utils import checkpoint
+@torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
     """
     Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
@@ -107,11 +109,11 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config) 
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + (self.attn(self.ln_1(x)))
+        x = x + (self.mlp(self.ln_2(x)))
         return x
 
 @dataclass
@@ -193,13 +195,13 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+            # loss = None
 
-        return logits, loss
+        return logits
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
