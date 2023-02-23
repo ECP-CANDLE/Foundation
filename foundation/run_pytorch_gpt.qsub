@@ -1,0 +1,94 @@
+#!/bin/sh
+#PBS -l select=10:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:50:00
+#PBS -l filesystems=home:eagle
+#PBS -q debug-scaling
+#PBS -A candle_aesp
+#PBS -M awells@anl.gov
+#PBS -N mingpt
+
+# Controlling the output of your application
+# UG Sec 3.3 page UG-40 Managing Output and Error Files
+# By default, PBS spools your output on the compute node and then uses scp to move it the
+# destination directory after the job finishes.  Since we have globally mounted file systems
+# it is highly recommended that you use the -k option to write directly to the destination
+# the doe stands for direct, output, error
+#PBS -k doe
+#PBS -o /lus/eagle/projects/candle_aesp/azton/Foundation/foundation/mingpt.out
+#PBS -e /lus/eagle/projects/candle_aesp/azton/Foundation/foundation/mingpt.err
+
+cd $PBS_O_WORKDIR
+DIR=$PBS_O_WORKDIR
+# source ~/.bashrc
+module load cudatoolkit-standalone/11.7.1
+module load conda/2023-01-10-unstable
+conda activate /home/azton/foundation
+# Internet access on nodes
+export HTTP_PROXY=http://proxy.alcf.anl.gov:3128
+export HTTPS_PROXY=http://proxy.alcf.anl.gov:3130
+export http_proxy=http://proxy.alcf.anl.gov:3128
+export https_proxy=http://proxy.alcf.anl.gov:3128
+git config --global http.proxy http://proxy.alcf.anl.gov:3128
+echo "Set HTTP_PROXY and to $HTTP_PROXY"
+
+# Set ADDR and PORT for communication
+master_node=$(cat $PBS_NODEFILE| head -1)
+export MASTER_ADDR=$(host $master_node | head -1 | awk '{print $4}')
+echo "MASTER NODE ${master_node} :: MASTER_ADDR ${MASTER_ADDR}"
+export MASTER_PORT=23450
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NCCL_NET_GDR_LEVEL=PHB
+export NCCL_COLLNET_ENABLE=1
+# export CUDA_VISIBLE_DEVICES=0
+# Enable GPU-MPI (if supported by application)
+export MPICH_GPU_SUPPORT_ENABLED=1
+
+
+# MPI and OpenMP settings
+export NNODES=`wc -l < $PBS_NODEFILE`
+export NRANKS_PER_NODE=4
+NDEPTH=16
+
+NTOTRANKS=$(( NNODES * NRANKS_PER_NODE ))
+echo "NUM_OF_NODES= ${NNODES} TOTAL_NUM_RANKS= ${NTOTRANKS} RANKS_PER_NODE= ${NRANKS_PER_NODE}"
+echo < $PBS_NODEFILE
+echo "TASK NUM = ${PBS_TASKNUM}"
+
+# NCCL settings
+# export NCCL_DEBUG=info
+export NCCL_NET_GDR_LEVEL=PHB
+
+
+DIR=`pwd`
+DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+mkdir -p $DIR/logs
+## use --use_hdf5 for limited dataset
+#train="/lus/eagle/projects/candle_aesp/azton/Foundation/foundation/test_data/train.jsonl"
+train="/lus/eagle/projects/candle_aesp/data/jsonl_pile/02.jsonl"
+# /lus/eagle/projects/candle_aesp/data/jsonl_pile/00.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/06.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/10.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/08.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/22.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/12.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/20.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/18.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/25.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/04.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/29.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/11.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/16.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/24.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/07.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/26.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/14.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/17.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/15.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/19.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/23.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/05.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/28.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/21.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/01.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/13.jsonl"
+#valf="/lus/eagle/projects/candle_aesp/azton/Foundation/foundation/test_data/validation.jsonl"
+valf="/lus/eagle/projects/candle_aesp/data/jsonl_pile/09.jsonl"
+#/lus/eagle/projects/candle_aesp/data/jsonl_pile/03.jsonl /lus/eagle/projects/candle_aesp/data/jsonl_pile/27.jsonl"
+
+nl=36
+nh=36
+embed=4608
+
+mpiexec -n ${NTOTRANKS} -ppn $NRANKS_PER_NODE --cpu-bind verbose,list:0,16,32,48 --hostfile $PBS_NODEFILE \
+        python -u pytorch_gpt.py \
+        -location sc \
+        --time_file ./${NNODES}nodes_nl${nl}_nh${nh}_emb${embed}.out \
+        --use_hdf5 False \
+        --training_files $train \
+        --validation_files $valf \
+        --num_layers $nl \
+        --num_heads $nh \
+        --embed_dim $embed \
+        --dropout 0.0 \
+        --max_epochs 5 \
+        --model nanogpt \
+        --log_dir ./ \
+        --datapath /lus/eagle/projects/candle_aesp/azton/data \
+        --run_name sm_gpt_test \
+        --learn_rate 1e-5
