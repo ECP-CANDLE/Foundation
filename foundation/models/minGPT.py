@@ -16,9 +16,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.distributed.fsdp.wrap import wrap # we'll manually wrap things. a wrap ~ a shard, so this level of control is nice.
+# from torch.distributed.fsdp.wrap import wrap # we'll manually wrap things. a wrap ~ a shard, so this level of control is nice.
                                             # roughly following https://medium.com/pytorch/training-a-1-trillion-parameter-model-with-pytorch-fully-sharded-data-parallel-on-aws-3ac13aa96cff
-from torch.utils import checkpoint
+# from torch.utils import checkpoint
 @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
     """
@@ -32,8 +32,14 @@ class LayerNorm(nn.Module):
 
     def __init__(self, ndim, bias):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.ndim=ndim
+        self.use_bias=bias
+        self.weight = nn.Parameter(torch.ones(ndim, device='meta'))
+        self.bias = nn.Parameter(torch.zeros(ndim, device='meta')) if bias else None
+
+    def reset_parameters(self):
+        self.weight = nn.Parameter(torch.ones(self.ndim))
+        self.bias = nn.Parameter(torch.zeros(self.ndim)) if self.use_bias else None
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
@@ -44,9 +50,9 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias, device='meta')
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, device='meta')
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -60,7 +66,9 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
-
+    def reset_parameters(self):
+        for n, p in self.named_parameters():
+            torch.nn.init.normal_(p, mean=0.0, std=0.02)
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
@@ -91,10 +99,12 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias, device='meta')
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias, device='meta')
         self.dropout = nn.Dropout(config.dropout)
-
+    def reset_parameters(self):
+        for n, p in self.named_parameters():
+            torch.nn.init.normal_(p, mean=0.0, std=0.02)
     def forward(self, x):
         x = self.c_fc(x)
         x = new_gelu(x)
@@ -110,6 +120,10 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config) 
+
+    def reset_parameters(self):
+        for n, p in self.named_parameters():
+            torch.nn.init.normal_(p, mean=0.0, std=0.02)
 
     def forward(self, x):
         x = x + (self.attn(self.ln_1(x)))
@@ -129,34 +143,39 @@ class GPTConfig:
 class GPT(nn.Module):
 
     def __init__(self, config):
+
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd).to('meta'),
+            wpe = nn.Embedding(config.block_size, config.n_embd).to('meta'),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            h = nn.ModuleList([Block(config).to('meta') for _ in range(config.n_layer)]),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias).to('meta'),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False, device='meta')
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
-        # init all weights
-        self.apply(self._init_weights)
+        # init all weights; do not init weights for LLM since weights wont fit on cpu at init.
+        # if device != 'meta'
+        # self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        # for pn, p in module.named_parameters():
+        #     if pn.endswith('c_proj.weight'):
+        #         torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+    
+    def reset_parameters(self):
+        self.apply(self._init_weights)
 
     def get_num_params(self, non_embedding=True):
         """
@@ -177,6 +196,10 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        
+        for pn, p in module.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * self.config.n_layer))
 
     def forward(self, idx, targets=None):
         device = idx.device
