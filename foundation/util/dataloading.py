@@ -7,7 +7,7 @@ import torch
 from tqdm import tqdm
 
 class PileH5Dataset(Dataset):
-    def __init__(self, datapath, split):
+    def __init__(self, datapath, split, args):
         self.filenames = sorted(glob.glob(datapath+'/*.h5'))
         nfiles = len(self.filenames)
         print(f"Found {nfiles} files under {split}.")
@@ -18,11 +18,11 @@ class PileH5Dataset(Dataset):
                 popfile = self.filenames.pop(i)
             if i%10 != 9 and split == 'test':
                 popfile = self.filenames.pop(i)
-
+        self.args = args
         nfiles = len(self.filenames)
         nlines = 0
         self.nperfile = 65536 # configured from utils/tokenize_and_format.py
-        self.window = 2048
+        self.window = args['seq_length']
         for fn in self.filenames:
             nlines += self.nperfile
         self.line_count = nlines
@@ -39,15 +39,23 @@ class PileH5Dataset(Dataset):
         with h5py.File(self.filenames[fileIdx], 'r') as f:
             tokens = f['input_ids'][dataIdx]
             attn = f['attention_mask'][dataIdx]
-        mask = torch.randint(0,2,size=(1,self.window), dtype=torch.bool).squeeze(0)
-        masked = torch.from_numpy(tokens).clone()
-        masked[mask] = 50258
-        label = torch.from_numpy(tokens).long()
+        if self.args['task'] == 'mask_gen':
+            mask = torch.randint(0,2,size=(1,self.window), dtype=torch.bool).squeeze(0)
+            masked = torch.from_numpy(tokens).clone()
+            masked[mask] = 50258
+            label = torch.from_numpy(tokens).long()
+        if self.args['task'] == 'next_token' and self.window < self.max_window:
+            masked = tokens[:self.window]
+            label = tokens[1:self.window+1]
+        
+        else: 
+            print('Somethings wrong in the dataloader nieghborhood')
+            exit()
 
         return {
-                    'masked_input':masked, 
-                    'input_ids':label, 
-                    'attention_mask':torch.from_numpy(attn)
+                    'input_ids': masked.int(), 
+                    'label_ids':label, 
+                    'attention_mask':torch.from_numpy(attn).bool()
                 }
         
 

@@ -29,15 +29,6 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     apply_activation_checkpointing
 )
 import torch.distributed as td
-
-from foundation.util.dataloading import PileH5Dataset
-from foundation.models.minGPT import (
-        GPT, 
-        GPTConfig, 
-        Block, 
-        MLP, 
-        CausalSelfAttention
-        )
 from datetime import datetime
 import time
 # from datasets import load_dataset
@@ -48,52 +39,21 @@ from tqdm import tqdm
 # from transformers import GPT2TokenizerFast
 from functools import partial
 import numpy as np
+from torch.utils.data import DistributedSampler
+from foundation.util.arguments import parse_arguments
+from foundation.util.dataloading import PileH5Dataset
+from foundation.util.profiler import LogAndProfiler
+from foundation.models.minGPT import (
+        GPT, 
+        GPTConfig, 
+        Block, 
+        MLP, 
+        CausalSelfAttention
+        )
 # POLARIS local rank = PMI_LOCAL_RANK
 # POLARIS local size = PMI_LOCAL_SIZE
 zero = int(os.environ['PMI_RANK']) == 0
-def parse_args():
-    par = ap()
 
-    par.add_argument('--num-gpus', '-gpus', type=int, default=None)
-
-    par.add_argument('--model', type=str, 
-                        default=None, 
-                        help="Model to process", 
-                        choices=['nanogpt'])
-    par.add_argument('--run_location', '-location', 
-                                type=str, 
-                                default=None, 
-                                help="where are we running? at home or on a remote (sc)? Will skip .distributed stuff at home", 
-                                choices=['home','sc'])
-    par.add_argument('--max_epochs', type=int, default=5)
-    par.add_argument('--log_dir', type=str, default='./')
-    par.add_argument('--time_file', type=str, default=None)
-    par.add_argument('--run_name', type=str, default=None)
-    par.add_argument('--learn_rate', type=float, default=None)
-    
-    par.add_argument('--num_layers','-nl', type=int, default=12)
-    par.add_argument('--num_heads', '-nh', type=int, default=12)
-    par.add_argument('--embed_dim', '-ed', type=int, default=768)
-    par.add_argument('--dropout', type=float, default=0.0)
-    par.add_argument('--use_hdf5', type=str, default='False')
-    par.add_argument('--datapath', type=str, default=None)
-    par.add_argument('--training_files', type=str, nargs='*', default=None)
-    par.add_argument('--validation_files', type=str, nargs='*', default=None)
-    par.add_argument('--local_rank', type=int, default=None)
-    par.add_argument('--activation_checkpointing', '-ac', type=str, default='false')
-    par.add_argument('--cpu_offload', type=str, default='false')
-    par=par.parse_args()
-    par.use_hdf5 = True if par.use_hdf5.lower()=='true' else False
-    par.activation_checkpointing = True if par.activation_checkpointing.lower() ==  'true' else False
-    par.cpu_offload = True if par.cpu_offload.lower() == 'true' else False
-    args = vars(par)
-    if zero:
-        print('Using parameters: ')
-        for k, v in args.items():
-            print(f"\t{k}:{v}")
-
-    args['strategy'] = 'fsdp_native'
-    return args
 
 def init_distributed(args):
 
@@ -118,74 +78,96 @@ def setup_environment(args, machine):
     return args
 def get_datasets(args):
     if args['use_hdf5']:
-        train_ds = PileH5Dataset(args['datapath'], 'train')
-        val_ds = PileH5Dataset(args['datapath'], 'validation')
-        traindl = DataLoader(train_ds, batch_size=1, num_workers=1, shuffle=True)
-        valdl = DataLoader(val_ds, batch_size=1, num_workers=1)
+        train_ds = PileH5Dataset(args['datapath'], 'train', args)
+        val_ds = PileH5Dataset(args['datapath'], 'validation', args)
+        tdsamp = DistributedSampler(train_ds, 
+                                    num_replicas=args['world_size'], 
+                                    rank=args['global_rank'],
+                                    shuffle=True,
+                                    )
+        vdsamp = DistributedSampler(val_ds, 
+                                    num_replicas=args['world_size'], 
+                                    rank=args['global_rank'],
+                                    shuffle=False,
+                                    )
+        traindl = DataLoader(train_ds, 
+                                batch_size=args['batch_size'], 
+                                num_workers=1, 
+                                sampler=tdsamp)
+        valdl = DataLoader(val_ds, 
+                           batch_size=args['batch_size'], 
+                           num_workers=1,
+                           sampler=vdsamp)
         args['num_train'] = len(traindl)
-    elif args['training_files'] is not None:
-        print('loading tokenizer, etc...')
-        # tokenizer = GPT2TokenizerFast.from_pretrained('gpt2', cache_dir = './pretrained_tokenizer')
-        # tokenizer.add_special_tokens({'pad_token':'<|pad|>'})
-        # tokenizer.add_special_tokens({'mask_token':'<|mask|>'})
-        # def map_function(example):
-        #     rval = tokenizer(example['text'], 
-        #                     max_length=2048, 
-        #                     padding='max_length', 
-        #                     truncation=True, 
-        #                     return_tensors="pt",)
-        #     return rval
-        # print('loading datasets... ')
-        # train_ds = load_dataset('json', 
-        #                         data_files=args['training_files'], 
-        #                         streaming=True, 
-        #                         split='train',
-        #                         # num_proc=8
-        #                         ).with_format("torch")
-        # val_ds = load_dataset('json', 
-        #                       data_files=args['validation_files'], 
-        #                       streaming=True, split='train',
-        #                     #   num_proc=8
-        #                     ).with_format("torch")
-        # print('mapping dataset...')
-        # train_ds = train_ds.map(map_function, 
-        #                     batched=True, 
-        #                     remove_columns=['text','meta'])
-        # val_ds = val_ds.map(map_function, 
-        #                     batched=True, 
-        #                     remove_columns=['text','meta'])
+    else:
+        print("Loading datasets without use_hdf5 is depracated. Enable use_hdf5 and give me better data")
+        raise NotImplemented
+    # elif args['training_files'] is not None:
+    #     print('Loading huggingface style.  Not recommended, as its slow and has race conditions...')
+    #     tokenizer = GPT2TokenizerFast.from_pretrained('gpt2', cache_dir = './pretrained_tokenizer')
+    #     tokenizer.add_special_tokens({'pad_token':'<|pad|>'})
+    #     tokenizer.add_special_tokens({'mask_token':'<|mask|>'})
+    #     def map_function(example):
+    #         rval = tokenizer(example['text'], 
+    #                         max_length=2048, 
+    #                         padding='max_length', 
+    #                         truncation=True, 
+    #                         return_tensors="pt",)
+    #         return rval
+    #     print('loading datasets... ')
+    #     train_ds = load_dataset('json', 
+    #                             data_files=args['training_files'], 
+    #                             streaming=True, 
+    #                             split='train',
+    #                             # num_proc=8
+    #                             ).with_format("torch")
+    #     val_ds = load_dataset('json', 
+    #                           data_files=args['validation_files'], 
+    #                           streaming=True, split='train',
+    #                         #   num_proc=8
+    #                         ).with_format("torch")
+    #     print('mapping dataset...')
+    #     train_ds = train_ds.map(map_function, 
+    #                         batched=True, 
+    #                         remove_columns=['text','meta'])
+    #     val_ds = val_ds.map(map_function, 
+    #                         batched=True, 
+    #                         remove_columns=['text','meta'])
 
-        # traindl = get_loader(train_ds)
-        # valdl = get_loader(val_ds)
+    #     traindl = get_loader(train_ds)
+    #     valdl = get_loader(val_ds)
     print('Dataloaders initialized...')
     return train_ds, traindl, val_ds, valdl
 
-def get_loader(dataset):
+def get_loader(dataset, batch_size, num_workers=2):
     return DataLoader(dataset, 
-                           batch_size=2, 
-                           num_workers=2, 
+                           batch_size=batch_size, 
+                           num_workers=1, 
                         #    collate_fn=dataset_collator,
                         #    persistent_workers=True
                         #    timeout=10
                         #    prefetch_factor=2,
                            )
+
+
 def init_model(args):
     if args['model'] == 'nanogpt':
         config = GPTConfig(
-            block_size = 2048, # configured in tokenizer to match GPT-3
+            block_size = args['seq_len'], # configured in tokenizer to match GPT-3
             vocab_size = 50304,
             n_layer = args['num_layers'],
             n_head = args['num_heads'],
             n_embd = args['embed_dim'],
             dropout = args['dropout'],
-            bias = True
+            bias = False,
+            init_device = 'meta' # must be true for ~<50B parameters
         )
         model = GPT(config)
 
         mixed_precision=MixedPrecision(
-            param_dtype=torch.float16,
-            reduce_dtype=torch.float16,
-            buffer_dtype=torch.float16
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16
         )
         twrap_policy = partial(
             transformer_auto_wrap_policy,
@@ -205,8 +187,17 @@ def init_model(args):
                     sharding_strategy=ShardingStrategy.FULL_SHARD, #FULL_SHARD, GRAD_SHARD_OP
                     cpu_offload=CPUOffload(offload_params=args['cpu_offload']),
                     backward_prefetch = BackwardPrefetch.BACKWARD_PRE, # bit faster async comms, bit higher memory
-                    
+                    limit_all_gathers=False,
+                    use_orig_params=True,
+                    forward_prefetch=True,
+
                     )
+        num_wpe = torch.zeros(1, device=torch.cuda.current_device())
+        for n, p in model.named_parameters():
+            print(f"Rank {args['global_rank']}: {n}; parameters size = {p.size()} on cuda:{p.get_device()}")
+            if 'wpe' in n:
+                num_wpe += p.size(0)
+        td.all_reduce(num_wpe, td.ReduceOp.SUM)
         # activation checkpointing might save memory, but its
         # super slow to initialize.  Lets only use it if absolutely necessary.
         if args['activation_checkpointing']:
@@ -216,147 +207,305 @@ def init_model(args):
                 model, checkpoint_wrapper_fn=non_reent_wrapper, check_fn=ckpt_fn
             )
             # print(f"Rank {args['global_rank']} finished AC wrapper in {time.time()-start} seconds...")
+        if args['compile_model']:
+            model = torch.compile(model)
+
 
     else:
         print(f"Model {args['model']} is not implemented")
         exit()
     print(f"[{args['global_rank']}] initializing {args['model']} completed.")
-    return model
+    return model, num_wpe.item()
 
-def run_val_epoch(model, loader, num_iter_max, loss_function, epoch):
-    model.eval()
-    loss = torch.zeros(2).to(torch.cuda.current_device())
-    flag_tens = torch.zeros(1).to(torch.cuda.current_device())
-    bar = None
-    train = model.training
-    # loader = get_loader(loader)
-    if zero:
-        bar = tqdm(total=num_iter_max, desc=f"{'Train' if train else 'Validation'} epoch {epoch:02d}", position=1)
-    for i, batch in enumerate(loader):
-        # print(f"{args['global_rank']}:: {i}")
-        if i > num_iter_max: # counting batches since... whatever.
-            flag_tens += 1
-        td.all_reduce(flag_tens, td.ReduceOp.SUM)
-        if flag_tens > 0:
-            break
-        with torch.no_grad():
-            logits = model(batch['masked_input'], batch['input_ids'])
-            thisloss = loss_function(logits, F.one_hot(batch['input_ids'], num_classes=50304).float().to(torch.cuda.current_device()))
+class NativeTrainer():
+    def __init__(self, model,
+                        optimizer,
+                        loss_function, 
+                        train_dataloader, 
+                        val_dataloader, 
+                        num_train_iter,
+                        num_val_iter,
+                        use_profiler,
+                        args,
+                        best_val_ckpt = True,
+                        best_train_ckpt = False,
+                        profile_timing = True,
+                        profile_memory = True,
+                        intra_epoch_write = True
+                        ):
+        self.args = args
+        self.model = model
+        self.optimizer = optimizer
+        self.loss_fn = loss_function
+        self.train_dataloader = train_dataloader
+        self.val_dataloader = val_dataloader
+        self.ntrain = num_train_iter
+        self.nval = num_val_iter
+        self.best_val_ckpt = best_val_ckpt
+        self.profile_timing = profile_timing
+        self.profile_memory = profile_memory
+        self.intra_epoch_write = intra_epoch_write
+        if self.intra_epoch_write and self.ntrain > 1000:
+            print(f"Warning: intra_epoch_write={self.intra_epoch_write} with num_train_iter={self.ntrain}!  there will be lots of writing to disk for mostly no reason!!!")
+            print("Raising 'DontDoThatError'")
+        self.logprofiler = LogAndProfiler(f"{args['log_dir']}/{args['run_name']}", args['global_rank']) if use_profiler else None
+
+        if self.logprofiler and zero:
+            self.logprofiler.save_hyperparams(args)
+            self.logprofiler.save_codebase()
+
+        self.val_record_epochloss = 99999
+        if zero:
+            self.token_bar = tqdm(total=3e11, desc="Tokens", position=0)
+        else:
+            self.token_bar = None
+        """
+            TODOS:
+                if this is a restart, we need to iterate the dataloaders to catch up to where we left off
+                if this is a restart, it would be nice to iterate to a set value as well--that way if we 
+                    hit a problematic point, we can iterate past that data.
+                Also update all the other metrics and make sure the logger isn't overwriting old information
+                    Eg if the .json exists, load it first, then continue
+                seed everything for reproducability.
+        """
+    def run_val_epoch(self, epoch, sanity=False):
+        self.model.eval()
+        loss = torch.zeros(2).to(torch.cuda.current_device())
+        flag_tens = torch.zeros(1).to(torch.cuda.current_device())
+        bar = None
+        train = self.model.training
+        # loader = get_loader(loader)
+        if zero:
+            bar = tqdm(total=self.nval if not sanity else 2, desc=f"{'Train' if train else 'Validation'} epoch {epoch:02d}", position=2)
+        for i, batch in enumerate(self.val_dataloader):
+            # print(f"{args['global_rank']}:: {i}")
+            nval = self.nval if not sanity else 2
+            if i > nval:
+                flag_tens += 1
+            # td.all_reduce(flag_tens, td.ReduceOp.SUM)
+            if flag_tens > 0:
+                break
+            with torch.no_grad():
+
+                # if self.profile_memory:
+                #     self.logprofiler.log_cuda_memory('pre_val_fwd')
+                # if self.profile_timing:
+                #     self.logprofiler.start('val_fwd')
+                logits = self.model(batch['input_ids'], batch['label_ids'])
+                # if self.profile_timing:
+                #     self.logprofiler.finish('val_fwd')
+                # if self.profile_memory:
+                #     self.logprofiler.log_cuda_memory('post_val_fwd')
+                    
+                thisloss = self.loss_fn(logits, F.one_hot(batch['input_ids'], num_classes=50304).float().to(torch.cuda.current_device()))
+                loss[0] += thisloss.detach()
+                loss[1] += batch['masked_input'].size(0) # batch size
+            if zero:
+                    
+                bar.update()
+                bar.set_postfix_str(f"Loss={loss[0].item()/loss[1].item():0.4f}")
+        # td.all_reduce(loss, op=td.ReduceOp.SUM)
+        # print(f"Rank {args['global_rank']} finished epoch {epoch} with {loss[0]/(loss[1]+1.)}...")
+        if zero: bar.close()
+        # self.logprofiler.save_log()
+        return loss[0] / (loss[1]+1.0)
+
+    def run_train_epoch(self, epoch):
+        # loader = get_loader(loader)
+        self.model.train()
+        loss = torch.zeros(2, device=torch.cuda.current_device())
+        flag_tens = torch.zeros(1, device=torch.cuda.current_device())
+        bar = None
+        train = self.model.training
+        if zero:
+            bar = tqdm(total=self.ntrain, desc=f"{'Train' if train else 'Validation'} epoch {epoch:02d}", position=2)
+        # print(f"Starting epoch {epoch} on rank {args['global_rank']}...")
+        for i, batch in enumerate(self.train_dataloader):
+            if i == 0:
+                bsize = torch.zeros(1, device=torch.cuda.current_device())
+                bsize += batch['input_ids'].size(0)
+                td.all_reduce(bsize, td.ReduceOp.SUM)
+                self.logprofiler.log_quantity('global_batch_size', bsize.item())
+            if i > self.ntrain: 
+                flag_tens += 1
+            # td.all_reduce(flag_tens, td.ReduceOp.SUM)
+            if flag_tens > 0:
+                break
+            if i > 0 and self.profile_timing:
+                self.logprofiler.finish('train/get_batch')
+            if self.profile_timing:
+                self.logprofiler.start('train/iteration')
+            # self.optimizer.zero_grad()
+            # https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html
+            for param in self.model.parameters():
+                param.grad = None
+            if self.profile_timing:
+                self.logprofiler.start('cuda_timing')
+            if self.profile_memory:
+                self.logprofiler.log_cuda_memory('pre_train_fwd')
+            if self.profile_timing:
+                self.logprofiler.finish('cuda_timing')
+            if self.profile_timing:
+                self.logprofiler.start('train_fwd')
+            logits = self.model(batch['input_ids'], batch['label_ids'], self.logprofiler)
+            # logits = self.model(batch['masked_input'], batch['input_ids'], self.logprofiler)
+            if self.profile_timing:
+                self.logprofiler.finish('train_fwd')
+            if self.profile_memory:
+                self.logprofiler.log_cuda_memory('post_train_fwd')
+            bz = batch['masked_input'].size(0)
+            thisloss = self.loss_fn(logits, F.one_hot(batch['input_ids'], num_classes=50304).float().to(torch.cuda.current_device()))
             loss[0] += thisloss.detach()
             loss[1] += batch['masked_input'].size(0) # batch size
+            
+            if self.profile_memory:
+                self.logprofiler.log_cuda_memory('pre_backward')
+            if self.profile_timing:
+                self.logprofiler.start('backward')
+            thisloss.backward()
+            if self.profile_timing:
+                self.logprofiler.finish('backward')
+            if self.profile_memory:
+                self.logprofiler.log_cuda_memory('post_backward')
+
+            if self.profile_memory:
+                self.logprofiler.log_cuda_memory('pre_optimizer_step')
+            if self.profile_timing:
+                self.logprofiler.start('optimizer_step')
+            self.optimizer.step()
+            if self.profile_timing:
+                self.logprofiler.finish('optimizer_step')
+            if zero:
+                self.token_bar.update(self.args['seq_len']*bz*args['world_size'])
+                bar.update()
+                bar.set_postfix_str(f"Loss={loss[0].item()/loss[1].item():0.4f}")
+            if self.intra_epoch_write:
+                self.logprofiler.save_log()
+            if self.profile_timing:
+                self.logprofiler.start('train/get_batch')
+            if self.profile_timing:
+                self.logprofiler.finish('train/iteration')
+        if zero: bar.close()
+        # td.all_reduce(loss, op=td.ReduceOp.SUM)
+        if self.logprofiler:
+            self.logprofiler.save_log()
+        # print(f"Rank {args['global_rank']} finished epoch {epoch} with {loss[0]/(loss[1]+1.)}...")
+        return loss[0] / (loss[1]+1.0)
+
+    def save_val_record_checkpoint(self, epochnum, vloss):
+        f"""
+            only save the model state dict, eg, for later inference.  use restart checkpoints 
+            to save optimizer states, etc, for continuing training.
+        """
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(
+                    self.model, StateDictType.FULL_STATE_DICT, save_policy
+                ):
+                    cpu_state = self.model.state_dict()
+        if zero:    
+            save_name = f"{args['log_dir']}/checkpoints/LLM_nl{args['num_layers']}_nh{args['num_heads']}_ed{args['embed_dim']}_epoch{epochnum:02d}_vloss{vloss:0.4f}"
+            torch.save(cpu_state, save_name)
+
+    def save_restart_checkpoint(self, epochnum):
+        f"""
+            special checkpoint where we'll save all relevant items for a restart, including optimizer states.  I hope.
+        """
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(
+                    self.model, StateDictType.FULL_STATE_DICT, save_policy
+                ):
+                    cpu_state = self.model.state_dict()
+        if zero:    
+            save_name = f"{args['log_dir']}/checkpoints/LLM_nl{args['num_layers']}_nh{args['num_heads']}_ed{args['embed_dim']}_epoch{epochnum:02d}_vloss{vloss:0.4f}"
+            torch.save({'model_state':cpu_state,
+                        'optimizer_state':self.optimizer.state_dict(),
+                        'record_loss':self.val_record_epochloss,
+                        'epoch_number':epochnum,
+                        'hyperparameters':self.args}, 
+                        save_name)
+            
+    def train_model(self):
         if zero:
-            if i%1000 == 1:
-                bar.write(f"Val Epoch {epoch:01d} : {i:06d} -- rank {args['global_rank']} using {torch.cuda.memory_allocated()/1024**3}")
-                
-            bar.update()
-            bar.set_postfix_str(f"Loss={loss[0].item()/loss[1].item():0.4f}")
-    # td.all_reduce(loss, op=td.ReduceOp.SUM)
-    # print(f"Rank {args['global_rank']} finished epoch {epoch} with {loss[0]/(loss[1]+1.)}...")
-    if zero: bar.close()
-    return loss[0] / (loss[1]+1.0)
+            epoch_bar = tqdm(total=args['max_epochs'], position=1, desc="Epoch")
 
-def run_train_epoch(model, loader, num_iter_max, optimizer, loss_function, epoch):
-    # loader = get_loader(loader)
-    model.train()
-    loss = torch.zeros(2).to(torch.cuda.current_device())
-    flag_tens = torch.zeros(1).to(torch.cuda.current_device())
-    bar = None
-    train = model.training
-    if zero:
-        bar = tqdm(total=num_iter_max, desc=f"{'Train' if train else 'Validation'} epoch {epoch:02d}", position=1)
-    # print(f"Starting epoch {epoch} on rank {args['global_rank']}...")
-    for i, batch in enumerate(loader):
-        # print(f"{args['global_rank']}:: {i}")
-        if i > num_iter_max: # counting batches since... whatever.
-            flag_tens += 1
-        td.all_reduce(flag_tens, td.ReduceOp.SUM)
-        
-        if flag_tens > 0:
-            break
-        optimizer.zero_grad()
-        logits = model(batch['masked_input'], batch['input_ids'])
-        thisloss = loss_function(logits, F.one_hot(batch['input_ids'], num_classes=50304).float().to(torch.cuda.current_device()))
-        loss[0] += thisloss.detach()
-        loss[1] += batch['masked_input'].size(0) # batch size
-        thisloss.backward()
-        optimizer.step()
-        if zero:
-            if i%1000 == 1:
-                bar.write(f"Train Epoch {epoch:01d} : {i:06d} -- rank {args['global_rank']} using {torch.cuda.memory_allocated()/1024**3}")
-                
-            bar.update()
-            bar.set_postfix_str(f"Loss={loss[0].item()/loss[1].item():0.4f}")
-    if zero: bar.close()
-    # td.all_reduce(loss, op=td.ReduceOp.SUM)
-    # print(f"Rank {args['global_rank']} finished epoch {epoch} with {loss[0]/(loss[1]+1.)}...")
-    return loss[0] / (loss[1]+1.0)
 
-def save_val_record_checkpoint(model, epochnum, vloss):
-    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(
-                model, StateDictType.FULL_STATE_DICT, save_policy
-            ):
-                cpu_state = model.state_dict()
-    if zero:    
-        save_name = f"checkpoints/LLM_nl{args['num_layers']}_nh{args['num_heads']}_ed{args['embed_dim']}_epoch{epochnum:02d}_vloss{vloss:0.4f}"
-        torch.save(cpu_state, save_name)
+        for e in range(args['max_epochs']):
+            
+            if hasattr(self.train_dataloader.dataset, 'set_epoch'):
+                self.train_dataloader.dataset.set_epoch(e)# each rank has different ordering, effectively distributed sampling
+                self.val_dataloader.dataset.set_epoch(e)
 
+            if e == 0:
+                vloss = self.run_val_epoch(0, sanity=True) # little sanity check at epoch 0
+                # print(f"{args['global_rank']} returned from sanity check...")
+
+            td.barrier()
+            # print(f"{args['global_rank']} starting training epoch")
+            tloss = self.run_train_epoch(e)
+            if self.logprofiler:
+                logloss = tloss.item()
+                self.logprofiler.tboard_log_scalar('train/epoch_loss', logloss, e)
+                self.logprofiler.tboard_log_scalar('train/epoch_ppl', np.exp(logloss), e)
+            # print(f"{args['global_rank']} returned from training epoch")
+
+            td.barrier()
+            # print(f"{args['global_rank']} starting validation epoch")
+            vloss = self.run_val_epoch(e)
+            if self.logprofiler:
+                logloss = vloss.item()
+                self.logprofiler.tboard_log_scalar('val/epoch_loss', logloss, e)
+                self.logprofiler.tboard_log_scalar('val/epoch_ppl', np.exp(logloss), e)
+            # self.exp_decay.step()
+            # self.plateau_decay.step(vloss.item())
+            # print(f"{args['global_rank']} returned from validation epoch")
+
+            td.barrier()
+            if vloss < self.val_record_epochloss and self.best_val_ckpt and args['record_ckpts']:
+                self.val_record_epochloss = vloss # vloss is already synced across tasks
+                self.save_val_record_checkpoint(e, vloss)
+            
+            run_time = self.logprofiler.check_runtime()
+            if self.args['restart_ckpts']:
+                if run_time > self.args['wall_time'] - 0.17:
+                    self.save_restart_checkpoint()
+            if zero:
+                epoch_bar.update()
 def run_pytorch_training(args):
 
-    # for k, v in os.environ.items():
-    #     if 'PMI' in k or 'PBS' in k:
-    #         print(f"{k}: {v}")
-    args=setup_environment(args, 'polaris')
+    args=setup_environment(args, args['run_location'])
     init_distributed(args)
     train_ds, traindl, val_ds, valdl = get_datasets(args)
-    model = init_model(args)
-    print(f"Rank {args['global_rank']} using {torch.cuda.memory_allocated()/1024**3}")
-    # for name, params in model.named_parameters():
-    #     print(f"Rank {args['global_rank']} ::: {name} ::: device {params.current_device}")
-    # print(model)
-    opt = torch.optim.AdamW(model.parameters(), args['learn_rate'])
+    model, num_wpe = init_model(args)
+    opt = torch.optim.SGD(model.parameters(), args['learn_rate'])
     loss_fn = nn.CrossEntropyLoss()
-    tlosses = []
-    vlosses = []
-    if zero:
-        overall_bar = tqdm(total=300*10**9, position=0)
 
-    train_epoch_batches = 5
-    val_epoch_batches = 2
-    batch_size=1
+    trainer = NativeTrainer(model, 
+                                opt,
+                                loss_fn,
+                                traindl,
+                                valdl,
+                                args['num_train_iter'],
+                                args['num_val_iter'],
+                                True,
+                                args,
+                                best_val_ckpt=True,
+                                profile_timing=True,
+                                profile_memory=True,
+                                intra_epoch_write=True)
+    trainer.logprofiler.log_quantity('wpe_layer', num_wpe)
+    trainer.logprofiler.log_quantity('num_initial_layers', num_wpe/ (args['seq_len']*args['embed_dim']))
 
-    for e in range(args['max_epochs']):
-        
-        if hasattr(train_ds, 'set_epoch'):
-            train_ds.set_epoch(e)# each rank has different ordering, effectively distributed sampling
-            val_ds.set_epoch(e)
+    trainer.train_model()
 
-        if e == 0:
-            vloss = run_val_epoch(model, valdl, 2, loss_fn,e) # little sanity check at epoch 0
-            # print(f"{args['global_rank']} returned from sanity check...")
-
-        td.barrier()
-        # print(f"{args['global_rank']} starting training epoch")
-        tloss = run_train_epoch(model, traindl, train_epoch_batches, opt, loss_fn,e)
-        tlosses.append(tloss.item())
-        if zero:
-            overall_bar.update(train_epoch_batches*batch_size*2048)
-        # print(f"{args['global_rank']} returned from training epoch")
-
-        td.barrier()
-        # print(f"{args['global_rank']} starting validation epoch")
-        vloss = run_val_epoch(model, valdl, val_epoch_batches, loss_fn,e)
-        vlosses.append(vloss)
-        # print(f"{args['global_rank']} returned from validation epoch")
-
-        td.barrier()
-        
-        save_val_record_checkpoint(model, e, vloss)
     if zero:
         print('Test run completed!!')
         print(torch.cuda.memory_summary())
     td.destroy_process_group()
+
+    
 if __name__=='__main__':
     print(f"Executing on pytorch version {torch.__version__}.")
-    args = parse_args()
+    args = parse_arguments()
+    if (not hasattr(torch, 'compile')) and args['compile_model']:
+        args['compile_model'] == False
     run_pytorch_training(args)
