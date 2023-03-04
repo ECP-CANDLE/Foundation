@@ -1,4 +1,4 @@
-from torch.utils.data import IterableDataset
+# from torch.utils.data import IterableDataset
 from torch.utils.data import Dataset
 import glob
 # from transformers import GPT2TokenizerFast
@@ -23,6 +23,7 @@ class PileH5Dataset(Dataset):
         nlines = 0
         self.nperfile = 65536 # configured from utils/tokenize_and_format.py
         self.window = args['seq_length']
+        self.max_window=2048
         for fn in self.filenames:
             nlines += self.nperfile
         self.line_count = nlines
@@ -45,8 +46,8 @@ class PileH5Dataset(Dataset):
             masked[mask] = 50258
             label = torch.from_numpy(tokens).long()
         if self.args['task'] == 'next_token' and self.window < self.max_window:
-            masked = tokens[:self.window]
-            label = tokens[1:self.window+1]
+            masked = torch.from_numpy(tokens[:self.window])
+            label = torch.from_numpy(tokens[1:self.window+1])
         
         else: 
             print('Somethings wrong in the dataloader nieghborhood')
@@ -54,7 +55,7 @@ class PileH5Dataset(Dataset):
 
         return {
                     'input_ids': masked.int(), 
-                    'label_ids':label, 
+                    'label_ids':label.long(), 
                     'attention_mask':torch.from_numpy(attn).bool()
                 }
         
