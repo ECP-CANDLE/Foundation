@@ -64,7 +64,7 @@ class PolarisEnvironment(ClusterEnvironment):
     def set_world_size(self, size: int = 1) -> None:
         pass
 
-def setup_strategy(args: dict):
+def setup_strategy(args: dict, model):
 
     if args['strategy'] == 'fsdp_native':
         mixed_precision=MixedPrecision(
@@ -76,6 +76,7 @@ def setup_strategy(args: dict):
             transformer_auto_wrap_policy,
             transformer_layer_cls={Block,}
         )
+
         strat_args = DDPFullyShardedNativeStrategy(
             cluster_environment=PolarisEnvironment(),
             parallel_devices=[torch.device('cuda:%d'%d) for d in [0,1,2,3]]*args['num_nodes'],          
@@ -90,7 +91,7 @@ def setup_strategy(args: dict):
         )
 
     elif args['strategy'] == 'deepspeed':
-        strat_args=DeepSpeedStrategy(
+        strat_args= DeepSpeedStrategy(
             zero_optimization=True,
             stage=3,
             offload_optimizer=args['cpu_offload'],
@@ -100,7 +101,7 @@ def setup_strategy(args: dict):
             offload_optimizer_device='cpu',
             nvme_path='/local/scratch',
             logging_batch_size_per_gpu=args['batch_size'],
-            partition_activations=True,
+            partition_activations=args['activation_checkpointing'],
             cpu_checkpointing=True,
             allgather_bucket_size=5e8,
             reduce_bucket_size=5e8,
@@ -110,5 +111,7 @@ def setup_strategy(args: dict):
             # note that if supplied all defaults are ignored - model settings defaults this arg to None
             # config=cfg.deepspeed_cfg_file
         )
+    elif args['strategy'] == 'colossalai':
+        strat_args='colossal_ai'
 
     return strat_args
