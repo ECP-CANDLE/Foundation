@@ -1,27 +1,39 @@
+from argparse import ArgumentParser as ap
+from datetime import datetime
+import time
+from functools import partial
+
+from pytorch_lightning.loggers import TensorBoardLogger
 import pytorch_lightning as ptl
-# from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.profilers import AdvancedProfiler
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+# from pytorch_lightning.utilities.meta import (
+#     init_meta_context
+# )
+
+import torch.distributed as td
 from torch.utils.data import DataLoader
 import torch, os
 import torch.multiprocessing as mp
-from pytorch_lightning.profilers import AdvancedProfiler
-from argparse import ArgumentParser as ap
-from pytorch_lightning.callbacks.early_stopping import EarlyStopping
-from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
-from torch.distributed.fsdp.wrap import (
-   always_wrap_policy as wrap_policy,
-   wrap
-)
-import torch.distributed as td
-from pytorch_lightning.strategies import DDPFullyShardedNativeStrategy
-
-from foundation.util.dataloading import PileH5Dataset
-from foundation.models.minGPT import GPT, GPTConfig, CausalSelfAttention, MLP
-from datetime import datetime
-import time
-from transformers import GPT2TokenizerFast, DataCollatorForLanguageModeling
-from datasets import load_dataset
 import torch.nn.functional as F
 import torch.nn as nn
+
+from foundation.util.dataloading import PileH5Dataset
+from foundation.util.distributed_strategies import (
+    setup_strategy,
+    setup_environment
+)
+from foundation.models.minGPT import (
+    GPT, 
+    GPTConfig, 
+    CausalSelfAttention, 
+    MLP, 
+    Block
+)
+from util.arguments import parse_arguments
+
+# from transformers import GPT2TokenizerFast, DataCollatorForLanguageModeling
+# from datasets import load_dataset
 
 def dataset_collator(data):
     nb = len(data)
@@ -52,16 +64,18 @@ class LightningGPT(ptl.LightningModule):
                     n_head = args['num_heads'],
                     n_embd = args['embed_dim'],
                     dropout = args['dropout'],
-                    bias = True
+                    bias = True,
+                    init_device='meta' if args['strategy'] == 'fsdp_native' else None
         )
         print('Initializing model...')
-        if args['training_files']:
+        if not args['use_hdf5']:
             self.tokenizer = GPT2TokenizerFast.from_pretrained('gpt2', 
                                                     cache_dir = './pretrained_tokenizer')
         else:
             self.tokenizer = None
         # self.model = torch.compile(GPT(config))
-        self.model = wrap(GPT(config))
+        # with torch.nn.utils.meta_init():
+        self.model = GPT(config)
         self.logfile = args['time_file']
         now = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
         with open(self.logfile, 'w') as f:
@@ -72,15 +86,18 @@ class LightningGPT(ptl.LightningModule):
         self.v0loss = 0
         self.t0loss = 0
         self.nlog = 101
+    
+    def reset_parameters(self):
+        pass
 
     def forward(self, batch):
         if self.args['training_files']:
             # print(batch)
-            logits = self.model(batch['masked_input'], batch['input_ids'])
+            logits = self.model(batch['input_ids'], batch['label_ids'])
         else:
-            logits = self.model(batch['input'], batch['label'])
+            logits = self.model(batch['input_ids'], batch['label_ids'])
         # print(F.one_hot(batch['input_ids'], num_classes=50304).size(), logits.size())
-        loss = self.loss_function(logits, F.one_hot(batch['input_ids'], num_classes=50304).float())
+        loss = self.loss_function(logits, F.one_hot(batch['label_ids'], num_classes=50304).float())
         return loss
     
     def training_step(self, batch, batch_idx):
@@ -90,20 +107,19 @@ class LightningGPT(ptl.LightningModule):
         # self.log('train_step_loss', loss.item())
         if batch_idx % self.nlog == 0  and self.args['time_file']:#and self.trainer.is_global_zero
             # try:
-            rank = torch.distributed.get_rank()
+            # rank = torch.distributed.get_rank()
+            # print(f'Greetings from rank {rank} on device cuda{torch.cuda.current_device()}!')
+            ms = torch.cuda.memory_stats()
+            print(f"Rank {self.args['local_rank']}/{self.args['global_rank']} is using {ms['active_bytes.all.peak']/1024**3} GB with {torch.cuda.utilization()} utilization on cuda:{torch.cuda.current_device()}.")
             # except RuntimeError as e:
             # rank = 0
-            util = '%0.1f'%(torch.cuda.memory_reserved()/1024/1024/1024)
-            with open(self.logfile, 'a') as f:
-                f.write(f"train        rank {rank} {batch_idx} {self.t0loss/self.nlog:0.6f} {time.time()-self.time:0.2f} s util: {util} GB\n")
-            self.t0loss = 0
             self.time = time.time()
         return loss
 
     def validation_step(self, batch, batch_idx):
         if batch_idx == 0:
                 print(f"Global rank {td.get_rank()} info: WORLD={td.get_world_size()}, has devices {torch.cuda.device_count}, {torch.cuda.current_device}")
-                print("Environment: ", os.environ)
+                # print("Environment: ", os.environ)
         loss = self(batch)
         self.v0loss += float(loss)
         # self.log('val_ste
@@ -120,69 +136,19 @@ class LightningGPT(ptl.LightningModule):
     
     def configure_optimizers(self):
         return torch.optim.AdamW(self.trainer.model.parameters(), self.args['learn_rate'])
-def setup_environment(args, machine):
-    if machine == 'polaris':
-        os.environ['RANK'] = os.environ['PMI_RANK']# global 
-        os.environ['WORLD_SIZE'] = os.environ['PMI_SIZE']
-        args['world_size'] = int(os.environ['PMI_SIZE'])
-        args['global_rank'] = int(os.environ['PMI_RANK'])
-        args['local_rank'] = int(os.environ['PMI_LOCAL_RANK']) # wraparound since LOCAL_RANK is actually global?? WRT/ 
-        args['local_size'] = int(os.environ['PMI_LOCAL_SIZE'])
-        args['backend'] = 'nccl'
-        args['num_nodes'] = args['world_size'] // args['local_size']
-    else:
-        print(f"{machine} not recognized, cannot initialize distributed environment")
-        exit()
-    return args
-def parse_args():
-    par = ap()
 
-    par.add_argument('--num-gpus', '-gpus', type=int, default=None)
-
-    par.add_argument('--model', type=str, 
-                        default=None, 
-                        help="Model to process", 
-                        choices=['nanogpt'])
-    par.add_argument('--run_location', '-location', 
-                                type=str, 
-                                default=None, 
-                                help="where are we running? at home or on a remote (sc)? Will skip .distributed stuff at home", 
-                                choices=['home','sc'])
-    par.add_argument('--max_epochs', type=int, default=5)
-    par.add_argument('--log_dir', type=str, default='./')
-    par.add_argument('--time_file', type=str, default=None)
-    par.add_argument('--run_name', type=str, default=None)
-    par.add_argument('--learn_rate', type=float, default=None)
-    
-    par.add_argument('--num_layers','-nl', type=int, default=12)
-    par.add_argument('--num_heads', '-nh', type=int, default=12)
-    par.add_argument('--embed_dim', '-ed', type=int, default=768)
-    par.add_argument('--dropout', type=float, default=0.0)
-    par.add_argument('--use_hdf5', type=str, default='False')
-    par.add_argument('--datapath', type=str, default=None)
-    par.add_argument('--training_files', type=str, nargs='*', default=None)
-    par.add_argument('--validation_files', type=str, nargs='*', default=None)
-    par.add_argument('--local_rank', type=int, default=None)
-    par=par.parse_args()
-    par.use_hdf5 = True if par.use_hdf5.lower()=='true' else False
-    args = vars(par)
-    for k, v in args.items():
-        print(f"{k}:{v}")
-
-    args['strategy'] = 'fsdp_native'
-    return args
 
 
 
 
 def train_foundation_model(args):
     # logger = TensorBoardLogger(save_dir=args['log_dir'], name=args['run_name'])
-    args = setup_environment(args, 'polaris')
+    # args = setup_environment(args, 'polaris')
     if args['use_hdf5']:
-        train_ds = PileH5Dataset(args['datapath'], 'train')
-        val_ds = PileH5Dataset(args['datapath'], 'validation')
-        traindl = DataLoader(train_ds, batch_size=1, num_workers=0)
-        valdl = DataLoader(val_ds, batch_size=1, num_workers=0)
+        train_ds = PileH5Dataset(args['datapath'], 'train', args)
+        val_ds = PileH5Dataset(args['datapath'], 'validation', args)
+        traindl = DataLoader(train_ds, batch_size=args['batch_size'], num_workers=1)
+        valdl = DataLoader(val_ds, batch_size=args['batch_size'], num_workers=1)
         args['num_train'] = len(traindl)
     elif args['training_files'] is not None:
         print('loading tokenizer, etc...')
@@ -210,42 +176,58 @@ def train_foundation_model(args):
         traindl = DataLoader(train_ds, batch_size=1, num_workers=0, collate_fn=dataset_collator)
         valdl = DataLoader(val_ds, batch_size=1, num_workers=0, collate_fn=dataset_collator)
     print('Dataloaders initialized...')
-    if args['strategy'] == 'fsdp_native':
-        strat_args = DDPFullyShardedNativeStrategy(
-            cpu_offload=CPUOffload(offload_params=False),
-            # sharding_strategy= FULL_SHARD,
-            auto_wrap_policy= wrap_policy,
-            # backward_prefetch=None,
-            # forward_prefetch=None,
-            process_group_backend="nccl",
-            # activation_checkpointing=MLP
-        )
+    # if args['strategy'] == 'fsdp_native':
+    #     mixed_precision=MixedPrecision(
+    #         param_dtype=torch.bfloat16,
+    #         reduce_dtype=torch.bfloat16,
+    #         buffer_dtype=torch.bfloat16
+    #     )
+    #     twrap_policy = partial(
+    #         transformer_auto_wrap_policy,
+    #         transformer_layer_cls={Block,}
+    #     )
+    #     strat_args = DDPFullyShardedNativeStrategy(
+    #         cluster_environment=PolarisEnvironment(),
+    #         parallel_devices=[torch.device('cuda:%d'%d) for d in [0,1,2,3]]*args['num_nodes'],          
+    #         cpu_offload=CPUOffload(offload_params=args['cpu_offload']),
+    #         sharding_strategy= ShardingStrategy.FULL_SHARD,
+    #         mixed_precision=mixed_precision,
+    #         auto_wrap_policy= twrap_policy,
+    #         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+    #         forward_prefetch=True,
+    #         process_group_backend="nccl",
+    #         activation_checkpointing=(Block,) if args['activation_checkpointing'] else None
+    #     )
     model = LightningGPT(args)
+    strat_args = setup_strategy(args, model.model)
     callbatcks = [EarlyStopping(monitor="val_step_loss", mode="min")]
-    now = datetime.now().strftime("%m-%d-%Y_%H-%M-%S")
-    nnodes = os.environ['NNODES']
 
     trainer = ptl.Trainer(
+        # plugins=[PolarisEnvironment()],
         logger=None,
+        num_nodes = args['num_nodes'],
         enable_progress_bar=True,
         profiler='simple',#AdvancedProfiler('./profile_log', filename=now),
         strategy=strat_args,
         accelerator='gpu',
         devices=-1,
-        num_nodes=nnodes,
         max_epochs=2,
         default_root_dir=args['log_dir'],
         precision=16,
         max_steps=5000,
-        limit_val_batches=1000,
-        limit_train_batches=5000
+        limit_val_batches=args['num_val_iter'],
+        limit_train_batches=args['num_train_iter'],
+        
     )
-
     # if trainer.is_global_zero: print('Beginning training run   ')
     trainer.fit(model, traindl, valdl, ckpt_path=None)
-
+    if td.is_global_zero():
+        print('Test run completed!!')
+        print(torch.cuda.memory_summary())
 if __name__=='__main__':
     print(f"Executing on pytorch version {torch.__version__}.")
-    args = parse_args()
+    args = parse_arguments()
+    args = setup_environment(args, args['run_location']) # for consistency
+    print(f"Master at {args['master_addr']} from node {args['node_id']}")
     # mp.set_start_method("spawn")
     train_foundation_model(args)
