@@ -5,10 +5,12 @@
 
 """
 
-from torch.utils.data import DataLoader
 import torch, os
-import torch.multiprocessing as mp
 from argparse import ArgumentParser as ap
+
+import torch.multiprocessing as mp
+from torch.utils.data import DataLoader
+from torch.utils.data import DistributedSampler
 from torch.distributed.fsdp.fully_sharded_data_parallel import (FullyShardedDataParallel as FSDP,
                                                                 CPUOffload,
                                                                 MixedPrecision,
@@ -31,15 +33,12 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 import torch.distributed as td
 from datetime import datetime
 import time
-# from datasets import load_dataset
 import torch.nn.functional as F
 import torch.nn as nn
 from tqdm import tqdm
-# from lightning_gpt import dataset_collator, parse_args
-# from transformers import GPT2TokenizerFast
 from functools import partial
 import numpy as np
-from torch.utils.data import DistributedSampler
+
 from foundation.util.arguments import parse_arguments
 from foundation.util.dataloading import PileH5Dataset
 from foundation.util.profiler import LogAndProfiler
@@ -59,8 +58,8 @@ def init_distributed(args):
 
     torch.cuda.set_device(args['local_rank'])
     td.init_process_group(backend=args['backend'], init_method="env://")
-    print(f"Global rank {td.get_rank()} info: WORLD={td.get_world_size()}, has devices {torch.cuda.device_count()}, on device = {torch.cuda.current_device()}")
-    print(f"Local rank {args['local_rank']}: {torch.cuda.current_device()}")
+    # print(f"Global rank {td.get_rank()} info: WORLD={td.get_world_size()}, has devices {torch.cuda.device_count()}, on device = {torch.cuda.current_device()}")
+    # print(f"Local rank {args['local_rank']}: {torch.cuda.current_device()}")
 
 def setup_environment(args, machine):
     if machine == 'polaris':
@@ -100,7 +99,7 @@ def get_datasets(args):
                            sampler=vdsamp)
         args['num_train'] = len(traindl)
     else:
-        print("Loading datasets without use_hdf5 is depracated. Enable use_hdf5 and give me better data")
+        print(f"Loading datasets without use_hdf5 is depracated. Enable use_hdf5 and give me better data")
         raise NotImplemented
     # elif args['training_files'] is not None:
     #     print('Loading huggingface style.  Not recommended, as its slow and has race conditions...')
@@ -153,7 +152,7 @@ def get_loader(dataset, batch_size, num_workers=2):
 def init_model(args):
     if args['model'] == 'nanogpt':
         config = GPTConfig(
-            block_size = args['seq_len'], # configured in tokenizer to match GPT-3
+            block_size = args['seq_length'], # configured in tokenizer to match GPT-3
             vocab_size = 50304,
             n_layer = args['num_layers'],
             n_head = args['num_heads'],
@@ -188,16 +187,16 @@ def init_model(args):
                     cpu_offload=CPUOffload(offload_params=args['cpu_offload']),
                     backward_prefetch = BackwardPrefetch.BACKWARD_PRE, # bit faster async comms, bit higher memory
                     limit_all_gathers=False,
-                    use_orig_params=True,
+                    # use_orig_params=True,
                     forward_prefetch=True,
 
                     )
-        num_wpe = torch.zeros(1, device=torch.cuda.current_device())
-        for n, p in model.named_parameters():
-            print(f"Rank {args['global_rank']}: {n}; parameters size = {p.size()} on cuda:{p.get_device()}")
-            if 'wpe' in n:
-                num_wpe += p.size(0)
-        td.all_reduce(num_wpe, td.ReduceOp.SUM)
+        # num_wpe = torch.zeros(1, device=torch.cuda.current_device())
+        # for n, p in model.named_parameters():
+        #     print(f"Rank {args['global_rank']}: {n}; parameters size = {p.size()} on cuda:{p.get_device()}")
+        #     if 'wpe' in n:
+        #         num_wpe += p.size(0)
+        # td.all_reduce(num_wpe, td.ReduceOp.SUM)
         # activation checkpointing might save memory, but its
         # super slow to initialize.  Lets only use it if absolutely necessary.
         if args['activation_checkpointing']:
@@ -215,7 +214,7 @@ def init_model(args):
         print(f"Model {args['model']} is not implemented")
         exit()
     print(f"[{args['global_rank']}] initializing {args['model']} completed.")
-    return model, num_wpe.item()
+    return model
 
 class NativeTrainer():
     def __init__(self, model,
@@ -247,7 +246,7 @@ class NativeTrainer():
         self.intra_epoch_write = intra_epoch_write
         if self.intra_epoch_write and self.ntrain > 1000:
             print(f"Warning: intra_epoch_write={self.intra_epoch_write} with num_train_iter={self.ntrain}!  there will be lots of writing to disk for mostly no reason!!!")
-            print("Raising 'DontDoThatError'")
+            print(f"Raising 'DontDoThatError'")
         self.logprofiler = LogAndProfiler(f"{args['log_dir']}/{args['run_name']}", args['global_rank']) if use_profiler else None
 
         if self.logprofiler and zero:
@@ -297,9 +296,9 @@ class NativeTrainer():
                 # if self.profile_memory:
                 #     self.logprofiler.log_cuda_memory('post_val_fwd')
                     
-                thisloss = self.loss_fn(logits, F.one_hot(batch['input_ids'], num_classes=50304).float().to(torch.cuda.current_device()))
+                thisloss = self.loss_fn(logits, F.one_hot(batch['label_ids'], num_classes=50304).float().to(torch.cuda.current_device()))
                 loss[0] += thisloss.detach()
-                loss[1] += batch['masked_input'].size(0) # batch size
+                loss[1] += batch['input_ids'].size(0) # batch size
             if zero:
                     
                 bar.update()
@@ -353,10 +352,12 @@ class NativeTrainer():
                 self.logprofiler.finish('train_fwd')
             if self.profile_memory:
                 self.logprofiler.log_cuda_memory('post_train_fwd')
-            bz = batch['masked_input'].size(0)
-            thisloss = self.loss_fn(logits, F.one_hot(batch['input_ids'], num_classes=50304).float().to(torch.cuda.current_device()))
+            bz = batch['input_ids'].size(0)
+            thisloss = self.loss_fn(logits, 
+                        F.one_hot(batch['label_ids'], 
+                        num_classes=50304).float().to(torch.cuda.current_device()))
             loss[0] += thisloss.detach()
-            loss[1] += batch['masked_input'].size(0) # batch size
+            loss[1] += batch['input_ids'].size(0) # batch size
             
             if self.profile_memory:
                 self.logprofiler.log_cuda_memory('pre_backward')
@@ -376,7 +377,7 @@ class NativeTrainer():
             if self.profile_timing:
                 self.logprofiler.finish('optimizer_step')
             if zero:
-                self.token_bar.update(self.args['seq_len']*bz*args['world_size'])
+                self.token_bar.update(self.args['seq_length']*bz*args['world_size'])
                 bar.update()
                 bar.set_postfix_str(f"Loss={loss[0].item()/loss[1].item():0.4f}")
             if self.intra_epoch_write:
@@ -393,7 +394,7 @@ class NativeTrainer():
         return loss[0] / (loss[1]+1.0)
 
     def save_val_record_checkpoint(self, epochnum, vloss):
-        f"""
+        """
             only save the model state dict, eg, for later inference.  use restart checkpoints 
             to save optimizer states, etc, for continuing training.
         """
@@ -407,7 +408,7 @@ class NativeTrainer():
             torch.save(cpu_state, save_name)
 
     def save_restart_checkpoint(self, epochnum):
-        f"""
+        """
             special checkpoint where we'll save all relevant items for a restart, including optimizer states.  I hope.
         """
         save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -475,8 +476,8 @@ def run_pytorch_training(args):
     args=setup_environment(args, args['run_location'])
     init_distributed(args)
     train_ds, traindl, val_ds, valdl = get_datasets(args)
-    model, num_wpe = init_model(args)
-    opt = torch.optim.SGD(model.parameters(), args['learn_rate'])
+    model = init_model(args)
+    opt = torch.optim.AdamW(model.parameters(), args['learn_rate'])
     loss_fn = nn.CrossEntropyLoss()
 
     trainer = NativeTrainer(model, 
@@ -492,8 +493,8 @@ def run_pytorch_training(args):
                                 profile_timing=True,
                                 profile_memory=True,
                                 intra_epoch_write=True)
-    trainer.logprofiler.log_quantity('wpe_layer', num_wpe)
-    trainer.logprofiler.log_quantity('num_initial_layers', num_wpe/ (args['seq_len']*args['embed_dim']))
+    # trainer.logprofiler.log_quantity('wpe_layer', num_wpe)
+    # trainer.logprofiler.log_quantity('num_initial_layers', num_wpe/ (args['seq_length']*args['embed_dim']))
 
     trainer.train_model()
 
