@@ -12,7 +12,8 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
-
+# import deepspeed
+from torch.utils.checkpoint import checkpoint
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -144,6 +145,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     init_device: str='meta'
+    distributed_strategy: str='fsdp_native'
 
 
 class GPT(nn.Module):
@@ -162,6 +164,7 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config).to(config.init_device) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias, init_device=config.init_device).to(config.init_device),
         ))
+
         print('embedded weights dim: ', self.transformer.wte.weight.size())
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False, device=config.init_device)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -227,7 +230,10 @@ class GPT(nn.Module):
         if profiler:
             profiler.start('transformer_layers')
         for block in self.transformer.h:
-            x = block(x)
+            if self.config.distributed_strategy == 'deepspeed':
+                x = checkpoint(block, x)
+            else:
+                x = block(x)
         x = self.transformer.ln_f(x)
         if profiler:
             profiler.finish('transformer_layers')
