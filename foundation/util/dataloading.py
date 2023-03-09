@@ -25,12 +25,13 @@ class PileH5Dataset(Dataset):
                 popfile = self.filenames.pop(i)
             if i%10 != 9 and split == 'test':
                 popfile = self.filenames.pop(i)
+        testfiles = h5py.File(self.filenames[0], 'r')['input_ids'].shape
         self.args = args
         nfiles = len(self.filenames)
         nlines = 0
         self.nperfile = 65536 # configured from utils/tokenize_and_format.py
         self.window = args['seq_length']
-        self.max_window=2048
+        self.max_window=testfiles[0]
         for fn in self.filenames:
             nlines += self.nperfile
         self.line_count = nlines
