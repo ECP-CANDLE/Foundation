@@ -72,5 +72,4 @@ def parse_arguments():
     for k, v in args.items():
         print(f"{k}:{v}")
 
-    args['strategy'] = 'fsdp_native'
     return args

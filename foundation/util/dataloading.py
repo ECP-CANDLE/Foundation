@@ -5,10 +5,17 @@ import glob
 import h5py
 import torch
 from tqdm import tqdm
+import numpy as np
 
 class PileH5Dataset(Dataset):
+    f"""
+    Dataset for Pile H5 files.  These have been preprocessed to contain only tokenized text.
+        Args: datapath: path to the directory containing the H5 files.
+          split: one of 'train', 'validation'
+          args: dictionary of arguments from the command line.
+    """
     def __init__(self, datapath, split, args):
-        self.filenames = sorted(glob.glob(datapath+'/*.h5'))
+        self.filenames = sorted(glob.glob(datapath+'*/*.h5'))
         nfiles = len(self.filenames)
         print(f"Found {nfiles} files under {split}.")
         for i in sorted(range(len(self.filenames)), reverse=True):
@@ -28,6 +35,9 @@ class PileH5Dataset(Dataset):
             nlines += self.nperfile
         self.line_count = nlines
         self.mask_token = 50258
+        self.pad_token = 50257
+        self.unk_token = 50259
+
         print(f"Found {nlines} examples for {split}.")
 
     def __len__(self):
@@ -38,8 +48,8 @@ class PileH5Dataset(Dataset):
         fileIdx = idx // self.nperfile
         dataIdx = idx % self.nperfile
         with h5py.File(self.filenames[fileIdx], 'r') as f:
-            tokens = f['input_ids'][dataIdx]
-            attn = f['attention_mask'][dataIdx]
+            tokens = f['input_ids'][dataIdx].astype(np.int32)
+            attn = (tokens != self.pad_token) # only pay attention to non-padding tokens
         if self.args['task'] == 'mask_gen':
             mask = torch.randint(0,2,size=(1,self.window), dtype=torch.bool).squeeze(0)
             masked = torch.from_numpy(tokens).clone()
