@@ -49,6 +49,8 @@ from foundation.models.minGPT import (
         MLP, 
         CausalSelfAttention
         )
+from transformers import GPTNeoXConfig, GPTNeoXForCausalLM
+from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXAttention, GPTNeoXMLP
 # POLARIS local rank = PMI_LOCAL_RANK
 # POLARIS local size = PMI_LOCAL_SIZE
 zero = int(os.environ['PMI_RANK']) == 0
@@ -162,12 +164,6 @@ def init_model(args):
             init_device = 'meta' # must be true for ~<50B parameters
         )
         model = GPT(config)
-
-        mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16
-        )
         twrap_policy = partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls={Block,}
@@ -178,19 +174,50 @@ def init_model(args):
             offload_to_cpu=args['cpu_offload'],
             checkpoint_impl=CheckpointImpl.NO_REENTRANT
         )
-        model = FSDP(model,
-                    # param_init_fn=model._init_weights,
-                    auto_wrap_policy=twrap_policy,
-                    mixed_precision=mixed_precision,
-                    device_id=torch.cuda.current_device(),
-                    sharding_strategy=ShardingStrategy.FULL_SHARD, #FULL_SHARD, GRAD_SHARD_OP
-                    cpu_offload=CPUOffload(offload_params=args['cpu_offload']),
-                    backward_prefetch = BackwardPrefetch.BACKWARD_PRE, # bit faster async comms, bit higher memory
-                    limit_all_gathers=False,
-                    # use_orig_params=True,
-                    forward_prefetch=True,
 
-                    )
+
+    elif args['model'] == 'transformergpt':
+        config = GPTNeoXConfig(
+            vocab_size = 50304,
+            hidden_size = args['embed_dim'],
+            intermediate_size = args['embed_dim']*4,
+            num_hidden_layers = args['num_layers'],
+            num_attention_heads = args['num_heads'],
+            hidden_act = 'gelu',
+            max_position_embeddings = args['seq_length'],
+            use_cache = True,
+        )
+        model = GPTNeoXForCausalLM(config)
+        twrap_policy = wrap_policy
+        twrap_policy = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={GPTNeoXAttention, GPTNeoXMLP}
+        )
+        ckpt_fn = lambda submod: isinstance(submod, GPTNeoXAttention) or isinstance(submod, GPTNeoXMLP)
+        non_reent_wrapper = partial(
+            checkpoint_wrapper,
+            offload_to_cpu=args['cpu_offload'],
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT
+        )
+    
+    mixed_precision=MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16
+    )
+    model = FSDP(model,
+                # param_init_fn=model._init_weights,
+                auto_wrap_policy=twrap_policy,
+                mixed_precision=mixed_precision,
+                device_id=torch.cuda.current_device(),
+                sharding_strategy=ShardingStrategy.FULL_SHARD, #FULL_SHARD, GRAD_SHARD_OP
+                cpu_offload=CPUOffload(offload_params=args['cpu_offload']),
+                backward_prefetch = BackwardPrefetch.BACKWARD_PRE, # bit faster async comms, bit higher memory
+                limit_all_gathers=False,
+                # use_orig_params=True,
+                forward_prefetch=True,
+
+                )
         # num_wpe = torch.zeros(1, device=torch.cuda.current_device())
         # for n, p in model.named_parameters():
         #     print(f"Rank {args['global_rank']}: {n}; parameters size = {p.size()} on cuda:{p.get_device()}")
@@ -199,20 +226,18 @@ def init_model(args):
         # td.all_reduce(num_wpe, td.ReduceOp.SUM)
         # activation checkpointing might save memory, but its
         # super slow to initialize.  Lets only use it if absolutely necessary.
-        if args['activation_checkpointing']:
-            # print(f"Rank {args['global_rank']} applying activation checkpointing wrapper")
-            # start = time.time()
-            apply_activation_checkpointing(
-                model, checkpoint_wrapper_fn=non_reent_wrapper, check_fn=ckpt_fn
-            )
-            # print(f"Rank {args['global_rank']} finished AC wrapper in {time.time()-start} seconds...")
-        if args['compile_model']:
-            model = torch.compile(model)
+    if args['activation_checkpointing']:
+        # print(f"Rank {args['global_rank']} applying activation checkpointing wrapper")
+        # start = time.time()
+        apply_activation_checkpointing(
+            model, checkpoint_wrapper_fn=non_reent_wrapper, check_fn=ckpt_fn
+        )
+        # print(f"Rank {args['global_rank']} finished AC wrapper in {time.time()-start} seconds...")
+    if args['compile_model']:
+        model = torch.compile(model)
 
 
-    else:
-        print(f"Model {args['model']} is not implemented")
-        exit()
+    
     print(f"[{args['global_rank']}] initializing {args['model']} completed.")
     return model
 
@@ -290,13 +315,15 @@ class NativeTrainer():
                 #     self.logprofiler.log_cuda_memory('pre_val_fwd')
                 # if self.profile_timing:
                 #     self.logprofiler.start('val_fwd')
-                logits = self.model(batch['input_ids'], batch['label_ids'])
+                logits = self.model(input_ids=batch['input_ids'], labels=batch['label_ids'])
                 # if self.profile_timing:
                 #     self.logprofiler.finish('val_fwd')
                 # if self.profile_memory:
                 #     self.logprofiler.log_cuda_memory('post_val_fwd')
-                    
-                thisloss = self.loss_fn(logits, F.one_hot(batch['label_ids'], num_classes=50304).float().to(torch.cuda.current_device()))
+                if self.args['model'] == 'nanogpt':
+                    thisloss = self.loss_fn(logits, F.one_hot(batch['label_ids'], num_classes=50304).float().to(torch.cuda.current_device()))
+                else:
+                    thisloss = logits.loss
                 loss[0] += thisloss.detach()
                 loss[1] += batch['input_ids'].size(0) # batch size
             if zero:
@@ -346,16 +373,17 @@ class NativeTrainer():
                 self.logprofiler.finish('cuda_timing')
             if self.profile_timing:
                 self.logprofiler.start('train_fwd')
-            logits = self.model(batch['input_ids'], batch['label_ids'], self.logprofiler)
+            logits = self.model(input_ids=batch['input_ids'], labels=batch['label_ids'])
             # logits = self.model(batch['masked_input'], batch['input_ids'], self.logprofiler)
             if self.profile_timing:
                 self.logprofiler.finish('train_fwd')
             if self.profile_memory:
                 self.logprofiler.log_cuda_memory('post_train_fwd')
             bz = batch['input_ids'].size(0)
-            thisloss = self.loss_fn(logits, 
-                        F.one_hot(batch['label_ids'], 
-                        num_classes=50304).float().to(torch.cuda.current_device()))
+            if self.args['model'] == 'nanogpt':
+                thisloss = self.loss_fn(logits, F.one_hot(batch['label_ids'], num_classes=50304).float().to(torch.cuda.current_device()))
+            else:
+                thisloss = logits.loss
             loss[0] += thisloss.detach()
             loss[1] += batch['input_ids'].size(0) # batch size
             
