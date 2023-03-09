@@ -7,9 +7,13 @@ from pytorch_lightning.loggers import TensorBoardLogger
 import pytorch_lightning as ptl
 from pytorch_lightning.profilers import AdvancedProfiler
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint
 # from pytorch_lightning.utilities.meta import (
 #     init_meta_context
 # )
+from colossalai.nn.optimizer import HybridAdam
+from colossalai.utils import colo_set_process_memory_fraction
+from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 
 import torch.distributed as td
 from torch.utils.data import DataLoader
@@ -17,7 +21,9 @@ import torch, os
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 import torch.nn as nn
-
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import ChainedScheduler
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from foundation.util.dataloading import PileH5Dataset
 from foundation.util.distributed_strategies import (
     setup_strategy,
@@ -31,9 +37,12 @@ from foundation.models.minGPT import (
     Block
 )
 from util.arguments import parse_arguments
-
+from util.lr_scheduler import CosineWarmupScheduler
+from util.distributed_strategies import PolarisEnvironment
 # from transformers import GPT2TokenizerFast, DataCollatorForLanguageModeling
 # from datasets import load_dataset
+
+zero = int(os.environ['PMI_RANK'])
 
 def dataset_collator(data):
     nb = len(data)
@@ -57,7 +66,10 @@ class LightningGPT(ptl.LightningModule):
         # args is a dict, not just the namespace thing
         super().__init__()
         self.args = args
-        config = GPTConfig(
+        self.save_hyperparameters(args)
+        self.strategy = args['strategy']
+        init_dev = 'meta' if args['strategy'] == 'fsdp_native' or args['strategy'] == 'colossalai' else None
+        self.gptconfig = GPTConfig(
                     block_size = 2048, # configured in tokenizer to match GPT-3
                     vocab_size = 50304,
                     n_layer = args['num_layers'],
@@ -65,7 +77,8 @@ class LightningGPT(ptl.LightningModule):
                     n_embd = args['embed_dim'],
                     dropout = args['dropout'],
                     bias = True,
-                    init_device='meta' if args['strategy'] == 'fsdp_native' else None
+                    init_device=init_dev, #if args['strategy'] == 'fsdp_native' else None,  
+                    distributed_strategy=args['strategy']
         )
         print('Initializing model...')
         if not args['use_hdf5']:
@@ -73,9 +86,7 @@ class LightningGPT(ptl.LightningModule):
                                                     cache_dir = './pretrained_tokenizer')
         else:
             self.tokenizer = None
-        # self.model = torch.compile(GPT(config))
-        # with torch.nn.utils.meta_init():
-        self.model = GPT(config)
+        # self.model = GPT(config)
         self.logfile = args['time_file']
         now = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
         with open(self.logfile, 'w') as f:
@@ -86,10 +97,52 @@ class LightningGPT(ptl.LightningModule):
         self.v0loss = 0
         self.t0loss = 0
         self.nlog = 101
+        # Init on meta for colossal and FSDP; deepspeed dont like that
+        # self.model = GPT(self.gptconfig)
     
+    def configure_sharded_model(self):
+        # if self.strategy != 'colossalai':
+        #     super().configure_sharded_model()
+        # else:
+            self.gptconfig.init_device = None
+            # Now init for real, and well add the deepspeed checkpoints
+            self.model = GPT(self.gptconfig)
+
     def reset_parameters(self):
         pass
+    def configure_optimizers(self):
+        if self.strategy != 'colossalai':
+            opt = torch.optim.AdamW(self.trainer.model.parameters(), self.args['learn_rate'])
+        elif self.strategy == 'deepspeed' and self.args['cpu_offload']:
+            opt = DeepSpeedCPUAdam(self.trainer.model.parameters(), self.args['learn_rate'])
+        elif self.strategy == 'deepspeed':
+            opt = FusedAdam(self.trainer.model.parameters(), self.args['learn_rate'])
+        elif self.strategy == 'colossalai':
+            opt = HybridAdam(self.trainer.model.parameters(), self.args['learn_rate'])
+        self.annealer = CosineWarmupScheduler(opt, 
+                                    warmup=4000,
+                                    max_iters=7e6 * 30.0 / (self.args['batch_size']*td.get_world_size()))
+        plateau = ReduceLROnPlateau(opt, 
+                                    mode='min', 
+                                    factor=0.5, 
+                                    patience=2, 
+                                    verbose=True, 
+                                    threshold=0.0001, 
+                                    threshold_mode='rel', 
+                                    cooldown=1, 
+                                    min_lr=1e-7, 
+                                    eps=1e-08,
+                                    )
+        # self.scheduler = ChainedScheduler([annealer, plateau])
 
+        return {'optimizer': opt, 'lr_scheduler': plateau, 'monitor': 'val/loss'}
+    def optimizer_step(self, *args, **kwargs):
+        super().optimizer_step(*args, **kwargs)
+        if not self.args['strategy'] == 'colossalai':
+            self.annealer.step()
+        for i, p in enumerate(self.optimizers().param_groups):
+            self.log(f'learn_rate_{i}', p['lr'], on_step=True)
+           
     def forward(self, batch):
         if self.args['training_files']:
             # print(batch)
@@ -104,8 +157,8 @@ class LightningGPT(ptl.LightningModule):
 
         loss = self(batch)
         self.t0loss += float(loss)
-        # self.log('train_step_loss', loss.item())
-        if batch_idx % self.nlog == 0  and self.args['time_file']:#and self.trainer.is_global_zero
+        self.log('train/loss', loss.item(), prog_bar=True, logger=True)
+        if batch_idx % self.nlog == 0  and self.args['time_file'] and self.current_epoch == 0:#and self.trainer.is_global_zero
             # try:
             # rank = torch.distributed.get_rank()
             # print(f'Greetings from rank {rank} on device cuda{torch.cuda.current_device()}!')
@@ -122,33 +175,27 @@ class LightningGPT(ptl.LightningModule):
                 # print("Environment: ", os.environ)
         loss = self(batch)
         self.v0loss += float(loss)
-        # self.log('val_ste
-        # p_loss', loss.item())
+        self.log('val/loss', loss.item(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
         if batch_idx % self.nlog == 0 and self.args['time_file']:#and self.trainer.is_global_zero 
             rank = torch.distributed.get_rank()
             # rank=0
             util = '%0.1f'%(torch.cuda.memory_reserved()/1024/1024/1024)
             with open(self.logfile, 'a') as f:
-                f.write(f"valid        rank {rank} {batch_idx} {self.t0loss/self.nlog:0.6f} {time.time()-self.time:0.2f} s util: {util} GB\n")
+                f.write(f"valid        rank {rank} {batch_idx} {self.v0loss/self.nlog:0.6f} {time.time()-self.time:0.2f} s util: {util} GB\n")
             self.time=time.time()
             self.v0loss = 0
         return loss
     
-    def configure_optimizers(self):
-        return torch.optim.AdamW(self.trainer.model.parameters(), self.args['learn_rate'])
-
-
-
 
 
 def train_foundation_model(args):
-    # logger = TensorBoardLogger(save_dir=args['log_dir'], name=args['run_name'])
+    logger = TensorBoardLogger(save_dir=args['log_dir'], name=args['run_name'])
     # args = setup_environment(args, 'polaris')
     if args['use_hdf5']:
         train_ds = PileH5Dataset(args['datapath'], 'train', args)
         val_ds = PileH5Dataset(args['datapath'], 'validation', args)
         traindl = DataLoader(train_ds, batch_size=args['batch_size'], num_workers=1)
-        valdl = DataLoader(val_ds, batch_size=args['batch_size'], num_workers=1)
+        valdl = DataLoader(val_ds, batch_size=args['batch_size'], num_workers=1, shuffle=True)
         args['num_train'] = len(traindl)
     elif args['training_files'] is not None:
         print('loading tokenizer, etc...')
@@ -176,52 +223,35 @@ def train_foundation_model(args):
         traindl = DataLoader(train_ds, batch_size=1, num_workers=0, collate_fn=dataset_collator)
         valdl = DataLoader(val_ds, batch_size=1, num_workers=0, collate_fn=dataset_collator)
     print('Dataloaders initialized...')
-    # if args['strategy'] == 'fsdp_native':
-    #     mixed_precision=MixedPrecision(
-    #         param_dtype=torch.bfloat16,
-    #         reduce_dtype=torch.bfloat16,
-    #         buffer_dtype=torch.bfloat16
-    #     )
-    #     twrap_policy = partial(
-    #         transformer_auto_wrap_policy,
-    #         transformer_layer_cls={Block,}
-    #     )
-    #     strat_args = DDPFullyShardedNativeStrategy(
-    #         cluster_environment=PolarisEnvironment(),
-    #         parallel_devices=[torch.device('cuda:%d'%d) for d in [0,1,2,3]]*args['num_nodes'],          
-    #         cpu_offload=CPUOffload(offload_params=args['cpu_offload']),
-    #         sharding_strategy= ShardingStrategy.FULL_SHARD,
-    #         mixed_precision=mixed_precision,
-    #         auto_wrap_policy= twrap_policy,
-    #         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-    #         forward_prefetch=True,
-    #         process_group_backend="nccl",
-    #         activation_checkpointing=(Block,) if args['activation_checkpointing'] else None
-    #     )
     model = LightningGPT(args)
-    strat_args = setup_strategy(args, model.model)
-    callbatcks = [EarlyStopping(monitor="val_step_loss", mode="min")]
-
+    strat_str = args['strategy']
+    strat_args = setup_strategy(args)
+    callbacks = [EarlyStopping(monitor="val/loss", mode="min"),
+                  ModelCheckpoint(monitor="val/loss", mode="min", save_top_k=3, save_last=True)]
     trainer = ptl.Trainer(
-        # plugins=[PolarisEnvironment()],
-        logger=None,
+        # plugins=[PolarisEnvironment()] if strat_str != 'fsdp_native' else None,
+        logger=logger,
         num_nodes = args['num_nodes'],
         enable_progress_bar=True,
+        callbacks=callbacks,
         profiler='simple',#AdvancedProfiler('./profile_log', filename=now),
         strategy=strat_args,
         accelerator='gpu',
+        num_sanity_val_steps=0,
         devices=-1,
         max_epochs=2,
         default_root_dir=args['log_dir'],
         precision=16,
         max_steps=5000,
+        val_check_interval=25,
         limit_val_batches=args['num_val_iter'],
         limit_train_batches=args['num_train_iter'],
+        log_every_n_steps=1,
         
     )
     # if trainer.is_global_zero: print('Beginning training run   ')
     trainer.fit(model, traindl, valdl, ckpt_path=None)
-    if td.is_global_zero():
+    if zero:
         print('Test run completed!!')
         print(torch.cuda.memory_summary())
 if __name__=='__main__':
