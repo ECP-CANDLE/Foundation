@@ -1,4 +1,5 @@
 from argparse import ArgumentParser as ap
+import deepspeed
 """
     Argument parser for LLMs using pytorch FSDP.
     We return args as a dict for easy integration into,
@@ -13,7 +14,7 @@ def parse_bool(arg):
         return False
     else:
         raise NotImplemented(f"{arg} has no meaning!")
-def parse_arguments():
+def parse_arguments(deepspeed_args:bool=False):
     par = ap()
 
     par.add_argument('--num-gpus', '-gpus', type=int, default=None)
@@ -21,7 +22,7 @@ def parse_arguments():
     par.add_argument('--model', type=str, 
                         default=None, 
                         help="Model to process", 
-                        choices=['nanogpt'])
+                        choices=['nanogpt', 'gpt_neox', 'gpt2_hf'])
     par.add_argument('--time_file', type=str, default=None,
                      help='Lightning GPT only.  noop for pytorch_gpt')
     par.add_argument('--walltime', type=float, default=1)
@@ -66,6 +67,7 @@ def parse_arguments():
     par.add_argument('--seq_length', type=int, default=2048)
     par.add_argument('--task', type=str, default='mask_gen', choices=['mask_gen', 'next_token'])
     
+    par = deepspeed.add_config_arguments(par)
     par=par.parse_args()
 
     args = vars(par)
