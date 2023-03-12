@@ -50,7 +50,10 @@ class LogAndProfiler():
         self.log_quantity(f'{label}/cuda_memory_allocated_peak', cm['allocated_bytes.all.peak']/1024**3)
         self.log_quantity(f'{label}/cuda_alloc_retries', cm['num_alloc_retries'])
         self.log_quantity(f"{label}/cuda_utilization", tcuda.utilization())
+
     def save_hyperparams(self, args):
+        if type(args) is not dict:
+            args = vars(args)
         with open(f"{self.save_fname}/hparams.json", 'w') as f:
             json.dump(args, f, indent=4)
 
@@ -63,7 +66,8 @@ class LogAndProfiler():
 
         shutil.copytree(f"{cpath}/foundation/util", f"{fname}/codebase/util", dirs_exist_ok=True)
         shutil.copytree(f"{cpath}/foundation/models", f"{fname}/codebase/models", dirs_exist_ok=True)
-        shutil.copy(f"{cpath}/foundation/pytorch_gpt.py", f"{fname}/codebase")
+        shutil.copy(f"{cpath}/foundation/pytorch_deepspeed.py", f"{fname}/codebase")
+        shutil.copy(f"{cpath}/foundation/pytorch_fsdp.py", f"{fname}/codebase")
 
     def check_runtime(self):
         return (time.time() - self.init_time)/3600 # return hours
