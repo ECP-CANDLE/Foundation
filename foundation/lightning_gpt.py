@@ -14,8 +14,12 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from colossalai.nn.optimizer import HybridAdam
 from colossalai.utils import colo_set_process_memory_fraction
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
-
+import deepspeed
 import torch.distributed as td
+from torch.distributed.fsdp.wrap import (
+   enable_wrap,
+   wrap,
+)
 from torch.utils.data import DataLoader
 import torch, os
 import torch.multiprocessing as mp
@@ -36,13 +40,19 @@ from foundation.models.minGPT import (
     MLP, 
     Block
 )
+from transformers import (
+    GPTNeoXForCausalLM,
+    GPT2LMHeadModel
+)
 from util.arguments import parse_arguments
+from models.load_models import get_config
+from models.load_models import init_model
 from util.lr_scheduler import CosineWarmupScheduler
 from util.distributed_strategies import PolarisEnvironment
 # from transformers import GPT2TokenizerFast, DataCollatorForLanguageModeling
 # from datasets import load_dataset
 
-zero = int(os.environ['PMI_RANK'])
+zero = int(os.environ['PMI_RANK'])==0
 
 def dataset_collator(data):
     nb = len(data)
@@ -68,19 +78,9 @@ class LightningGPT(ptl.LightningModule):
         self.args = args
         self.save_hyperparameters(args)
         self.strategy = args['strategy']
-        init_dev = 'meta' if args['strategy'] == 'fsdp_native' or args['strategy'] == 'colossalai' else None
-        self.gptconfig = GPTConfig(
-                    block_size = 2048, # configured in tokenizer to match GPT-3
-                    vocab_size = 50304,
-                    n_layer = args['num_layers'],
-                    n_head = args['num_heads'],
-                    n_embd = args['embed_dim'],
-                    dropout = args['dropout'],
-                    bias = True,
-                    init_device=init_dev, #if args['strategy'] == 'fsdp_native' else None,  
-                    distributed_strategy=args['strategy']
-        )
-        print('Initializing model...')
+        self.modelconfig = get_config(args)
+
+        if zero: print('Initializing model...')
         if not args['use_hdf5']:
             self.tokenizer = GPT2TokenizerFast.from_pretrained('gpt2', 
                                                     cache_dir = './pretrained_tokenizer')
@@ -91,33 +91,47 @@ class LightningGPT(ptl.LightningModule):
         now = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
         with open(self.logfile, 'w') as f:
             f.write(f"{now}\n")
-        print('Initialization complete...')
+        if zero: print('Initialization complete...')
         self.time = time.time()
         self.loss_function = nn.CrossEntropyLoss()
         self.v0loss = 0
         self.t0loss = 0
         self.nlog = 101
         # Init on meta for colossal and FSDP; deepspeed dont like that
-        # self.model = GPT(self.gptconfig)
-    
-    def configure_sharded_model(self):
-        # if self.strategy != 'colossalai':
-        #     super().configure_sharded_model()
-        # else:
-            self.gptconfig.init_device = None
-            # Now init for real, and well add the deepspeed checkpoints
-            self.model = GPT(self.gptconfig)
+        if args['model'] == 'gpt2_hf':
+            with deepspeed.zero.Init():
+                self.model = GPT2LMHeadModel(self.modelconfig)
+        elif args['model'] == 'gpt_neox':
+            with deepspeed.zero.Init():
+                self.model = GPTNeoXForCausalLM(self.modelconfig)
+        elif args['model'] == 'nanogpt':
+            with deepspeed.zero.Init():
+                self.model = GPT(self.modelconfig)
+    # def configure_sharded_model(self):
+    #     if hasattr(self.modelconfig, 'init_device'):
+    #         self.modelconfig.init_device = None
+    #     # Now init for real, and well add the deepspeed checkpoints
+    #     if self.args['strategy'] == 'fsdp_native':
+    #         self.model = init_model(self.args)
+    #     else:
+    #         if self.args['model'] == 'nanogpt':
+    #             self.model = GPT(self.modelconfig)
+    #         elif self.args['model'] == 'gpt2_hf':
+    #             self.model = GPT2LMHeadModel(self.modelconfig)
+    #         elif self.args['model'] == 'gpt_neox':
+    #             self.model = GPTNeoXForCausalLM(self.modelconfig)
+
 
     def reset_parameters(self):
         pass
     def configure_optimizers(self):
-        if self.strategy != 'colossalai':
+        if self.strategy == 'fsdp_native':
             opt = torch.optim.AdamW(self.trainer.model.parameters(), self.args['learn_rate'])
         elif self.strategy == 'deepspeed' and self.args['cpu_offload']:
             opt = DeepSpeedCPUAdam(self.trainer.model.parameters(), self.args['learn_rate'])
         elif self.strategy == 'deepspeed':
             opt = FusedAdam(self.trainer.model.parameters(), self.args['learn_rate'])
-        elif self.strategy == 'colossalai':
+        if self.strategy == 'colossalai':
             opt = HybridAdam(self.trainer.model.parameters(), self.args['learn_rate'])
         self.annealer = CosineWarmupScheduler(opt, 
                                     warmup=4000,
@@ -148,9 +162,12 @@ class LightningGPT(ptl.LightningModule):
             # print(batch)
             logits = self.model(batch['input_ids'], batch['label_ids'])
         else:
-            logits = self.model(batch['input_ids'], batch['label_ids'])
+            logits = self.model(input_ids=batch['input_ids'], labels=batch['label_ids'])
         # print(F.one_hot(batch['input_ids'], num_classes=50304).size(), logits.size())
-        loss = self.loss_function(logits, F.one_hot(batch['label_ids'], num_classes=50304).float())
+        if hasattr(logits, 'loss'):
+            loss = logits.loss
+        else:
+            loss = logits[1] # nanoGPT returns (logits, loss)
         return loss
     
     def training_step(self, batch, batch_idx):
@@ -224,26 +241,29 @@ def train_foundation_model(args):
         valdl = DataLoader(val_ds, batch_size=1, num_workers=0, collate_fn=dataset_collator)
     print('Dataloaders initialized...')
     model = LightningGPT(args)
-    strat_str = args['strategy']
     strat_args = setup_strategy(args)
     callbacks = [EarlyStopping(monitor="val/loss", mode="min"),
-                  ModelCheckpoint(monitor="val/loss", mode="min", save_top_k=3, save_last=True)]
+                  ModelCheckpoint(monitor="val/loss", 
+                                  filename='{epoch}-{val/loss:.2f}',
+                                  mode="min", 
+                                  save_top_k=3, 
+                                  save_last=True)]
     trainer = ptl.Trainer(
         # plugins=[PolarisEnvironment()] if strat_str != 'fsdp_native' else None,
         logger=logger,
         num_nodes = args['num_nodes'],
         enable_progress_bar=True,
         callbacks=callbacks,
-        profiler='simple',#AdvancedProfiler('./profile_log', filename=now),
+        profiler=None,#'simple',#AdvancedProfiler('./profile_log', filename=now),
         strategy=strat_args,
         accelerator='gpu',
         num_sanity_val_steps=0,
         devices=-1,
-        max_epochs=2,
+        max_epochs=args['max_epochs'],
         default_root_dir=args['log_dir'],
         precision=16,
         max_steps=5000,
-        val_check_interval=25,
+        val_check_interval=args['num_train_iter'],
         limit_val_batches=args['num_val_iter'],
         limit_train_batches=args['num_train_iter'],
         log_every_n_steps=1,
@@ -253,11 +273,18 @@ def train_foundation_model(args):
     trainer.fit(model, traindl, valdl, ckpt_path=None)
     if zero:
         print('Test run completed!!')
-        print(torch.cuda.memory_summary())
+        # print(torch.cuda.memory_summary())
 if __name__=='__main__':
     print(f"Executing on pytorch version {torch.__version__}.")
     args = parse_arguments()
     args = setup_environment(args, args['run_location']) # for consistency
+    if args['strategy'] == 'deepspeed':
+        deepspeed.init_distributed(dist_backend='nccl',
+                                   init_method="env://",
+                                   rank=args['global_rank'],
+                                   world_size=args['world_size'],
+                                   auto_mpi_discovery=False,
+                                   dist_init_required=True)
     print(f"Master at {args['master_addr']} from node {args['node_id']}")
     # mp.set_start_method("spawn")
     train_foundation_model(args)
